@@ -61,6 +61,8 @@
 
 #define MAP_CMD_SIZE 16
 
+#define TEST_LIMIT 8388608
+
 namespace android {
 namespace bpf {
 
@@ -157,10 +159,9 @@ int bpfFdGet(const char* pathname, uint32_t flags);
 int attachProgram(bpf_attach_type type, uint32_t prog_fd, uint32_t cg_fd);
 int detachProgram(bpf_attach_type type, uint32_t cg_fd);
 uint64_t getSocketCookie(int sockFd);
+int setrlimitForTest();
 std::string BpfLevelToString(BpfLevel BpfLevel);
 BpfLevel getBpfSupportLevel();
-int parseProgramsFromFile(const char* path, BpfProgInfo* programs, size_t size,
-                          const std::vector<BpfMapInfo>& mapPatterns);
 int synchronizeKernelRCU();
 
 #define SKIP_IF_BPF_NOT_SUPPORTED                                                    \
@@ -175,9 +176,6 @@ int synchronizeKernelRCU();
     do {                                                                                \
         if (android::bpf::getBpfSupportLevel() != android::bpf::BpfLevel::NONE) return; \
     } while (0)
-
-constexpr int BPF_CONTINUE = 0;
-constexpr int BPF_DELETED = 1;
 
 bool operator==(const StatsValue& lhs, const StatsValue& rhs);
 bool operator==(const UidTag& lhs, const UidTag& rhs);

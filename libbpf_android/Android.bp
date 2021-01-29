@@ -18,18 +18,23 @@ cc_library_headers {
     name: "libbpf_android_headers",
     vendor_available: false,
     host_supported: false,
+    native_bridge_supported: true,
     export_include_dirs: ["include"],
     target: {
         linux_bionic: {
             enabled: true,
         },
     },
+    sdk_version: "30",
+    header_libs: ["bpf_syscall_wrappers"],
+    export_header_lib_headers: ["bpf_syscall_wrappers"],
 }
 
 cc_library {
     name: "libbpf_android",
     vendor_available: false,
     host_supported: false,
+    native_bridge_supported: true,
     target: {
         android: {
             srcs: [

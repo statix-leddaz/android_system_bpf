@@ -23,7 +23,6 @@
 #include <linux/bpf.h>
 
 // Pull in AID_* constants from //system/core/libcutils/include/private/android_filesystem_config.h
-#define EXCLUDE_FS_CONFIG_STRUCTURES
 #include <private/android_filesystem_config.h>
 
 /*
@@ -58,8 +57,9 @@ struct bpf_prog_def {
     unsigned int uid;
     unsigned int gid;
 
-    unsigned int min_kver;  // KERNEL_MAJOR * 65536 + KERNEL_MINOR * 256 + KERNEL_SUB
-    unsigned int max_kver;  // ie. 0x40900 for Linux 4.9 - but beware of hexadecimal for >= 10
+    // kernelVersion() must be >= min_kver and < max_kver
+    unsigned int min_kver;
+    unsigned int max_kver;
 
-    bool optional;  // program section (ie. function) may fail to load, continue onto next func. 
+    bool optional;  // program section (ie. function) may fail to load, continue onto next func.
 };

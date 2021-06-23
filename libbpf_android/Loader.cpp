@@ -29,7 +29,6 @@
 #include <unistd.h>
 
 #include "../progs/include/bpf_map_def.h"
-#include "LoaderUtils.h"
 #include "bpf/BpfUtils.h"
 #include "include/libbpf_android.h"
 
@@ -40,7 +39,6 @@
 #include <string>
 #include <vector>
 
-#include <android-base/properties.h>
 #include <android-base/strings.h>
 #include <android-base/unique_fd.h>
 
@@ -60,6 +58,17 @@ using std::vector;
 namespace android {
 namespace bpf {
 
+static string pathToFilename(const string& path, bool noext = false) {
+    vector<string> spath = android::base::Split(path, "/");
+    string ret = spath.back();
+
+    if (noext) {
+        size_t lastindex = ret.find_last_of('.');
+        return ret.substr(0, lastindex);
+    }
+    return ret;
+}
+
 typedef struct {
     const char* name;
     enum bpf_prog_type type;
@@ -73,15 +82,16 @@ typedef struct {
  * is the name of the program, and tracepoint is the type.
  */
 sectionType sectionNameTypes[] = {
-    {"kprobe", BPF_PROG_TYPE_KPROBE},
-    {"tracepoint", BPF_PROG_TYPE_TRACEPOINT},
-    {"skfilter", BPF_PROG_TYPE_SOCKET_FILTER},
-    {"cgroupskb", BPF_PROG_TYPE_CGROUP_SKB},
-    {"schedcls", BPF_PROG_TYPE_SCHED_CLS},
-    {"cgroupsock", BPF_PROG_TYPE_CGROUP_SOCK},
+        {"kprobe", BPF_PROG_TYPE_KPROBE},
+        {"tracepoint", BPF_PROG_TYPE_TRACEPOINT},
+        {"skfilter", BPF_PROG_TYPE_SOCKET_FILTER},
+        {"cgroupskb", BPF_PROG_TYPE_CGROUP_SKB},
+        {"schedcls", BPF_PROG_TYPE_SCHED_CLS},
+        {"cgroupsock", BPF_PROG_TYPE_CGROUP_SOCK},
+        {"xdp", BPF_PROG_TYPE_XDP},
 
-    /* End of table */
-    {"END", BPF_PROG_TYPE_UNSPEC},
+        /* End of table */
+        {"END", BPF_PROG_TYPE_UNSPEC},
 };
 
 typedef struct {
@@ -125,11 +135,8 @@ static int readSectionHeadersAll(ifstream& elfFile, vector<Elf64_Shdr>& shTable)
 /* Read a section by its index - for ex to get sec hdr strtab blob */
 static int readSectionByIdx(ifstream& elfFile, int id, vector<char>& sec) {
     vector<Elf64_Shdr> shTable;
-    int entries, ret = 0;
-
-    ret = readSectionHeadersAll(elfFile, shTable);
+    int ret = readSectionHeadersAll(elfFile, shTable);
     if (ret) return ret;
-    entries = shTable.size();
 
     elfFile.seekg(shTable[id].sh_offset);
     if (elfFile.fail()) return -1;
@@ -143,9 +150,7 @@ static int readSectionByIdx(ifstream& elfFile, int id, vector<char>& sec) {
 /* Read whole section header string table */
 static int readSectionHeaderStrtab(ifstream& elfFile, vector<char>& strtab) {
     Elf64_Ehdr eh;
-    int ret = 0;
-
-    ret = readElfHeader(elfFile, &eh);
+    int ret = readElfHeader(elfFile, &eh);
     if (ret) return ret;
 
     ret = readSectionByIdx(elfFile, eh.e_shstrndx, strtab);
@@ -256,7 +261,7 @@ static string getSectionName(enum bpf_prog_type type)
 {
     for (int i = 0; sectionNameTypes[i].type != BPF_PROG_TYPE_UNSPEC; i++)
         if (sectionNameTypes[i].type == type)
-            return std::string(sectionNameTypes[i].name);
+            return string(sectionNameTypes[i].name);
 
     return NULL;
 }
@@ -268,7 +273,7 @@ static bool isRelSection(codeSection& cs, string& name) {
 
         if (st.type != cs.type) continue;
 
-        if (StartsWith(name, std::string(".rel") + st.name + "/"))
+        if (StartsWith(name, string(".rel") + st.name + "/"))
             return true;
         else
             return false;
@@ -313,7 +318,7 @@ static int getSectionSymNames(ifstream& elfFile, const string& sectionName, vect
 
     /* No section found with matching name*/
     if (sec_idx == -1) {
-        ALOGE("No %s section could be found in elf object\n", sectionName.c_str());
+        ALOGW("No %s section could be found in elf object\n", sectionName.c_str());
         return -1;
     }
 
@@ -356,7 +361,10 @@ static int readCodeSections(ifstream& elfFile, vector<codeSection>& cs) {
         enum bpf_prog_type ptype = getSectionType(name);
         if (ptype != BPF_PROG_TYPE_UNSPEC) {
             string oldName = name;
-            deslash(name);
+
+            // convert all slashes to underscores
+            std::replace(name.begin(), name.end(), '/', '_');
+
             cs_temp.type = ptype;
             cs_temp.name = name;
 
@@ -407,7 +415,8 @@ static int getSymNameByIdx(ifstream& elfFile, int index, string& name) {
     return getSymName(elfFile, symtab[index].st_name, name);
 }
 
-static int createMaps(const char* elfPath, ifstream& elfFile, vector<unique_fd>& mapFds) {
+static int createMaps(const char* elfPath, ifstream& elfFile, vector<unique_fd>& mapFds,
+                      const char* prefix) {
     int ret;
     vector<char> mdData;
     vector<struct bpf_map_def> md;
@@ -425,23 +434,46 @@ static int createMaps(const char* elfPath, ifstream& elfFile, vector<unique_fd>&
 
     for (int i = 0; i < (int)mapNames.size(); i++) {
         unique_fd fd;
-        // Format of pin location is /sys/fs/bpf/map_<filename>_<mapname>
+        int saved_errno;
+        // Format of pin location is /sys/fs/bpf/<prefix>map_<filename>_<mapname>
         string mapPinLoc;
         bool reuse = false;
 
-        mapPinLoc = string(BPF_FS_PATH) + "map_" + fname + "_" + string(mapNames[i]);
+        mapPinLoc = string(BPF_FS_PATH) + prefix + "map_" + fname + "_" + string(mapNames[i]);
         if (access(mapPinLoc.c_str(), F_OK) == 0) {
             fd.reset(bpf_obj_get(mapPinLoc.c_str()));
+            saved_errno = errno;
             ALOGD("bpf_create_map reusing map %s, ret: %d\n", mapNames[i].c_str(), fd.get());
             reuse = true;
         } else {
-            fd.reset(bpf_create_map(md[i].type, mapNames[i].c_str(), md[i].key_size, md[i].value_size,
+            enum bpf_map_type type = md[i].type;
+            if (type == BPF_MAP_TYPE_DEVMAP && !isAtLeastKernelVersion(4, 14, 0)) {
+                // On Linux Kernels older than 4.14 this map type doesn't exist, but it can kind
+                // of be approximated: ARRAY has the same userspace api, though it is not usable
+                // by the same ebpf programs.  However, that's okay because the bpf_redirect_map()
+                // helper doesn't exist on 4.9 anyway (so the bpf program would fail to load,
+                // and thus needs to be tagged as 4.14+ either way), so there's nothing useful you
+                // could do with a DEVMAP anyway (that isn't already provided by an ARRAY)...
+                // Hence using an ARRAY instead of a DEVMAP simply makes life easier for userspace.
+                type = BPF_MAP_TYPE_ARRAY;
+            }
+            if (type == BPF_MAP_TYPE_DEVMAP_HASH && !isAtLeastKernelVersion(5, 4, 0)) {
+                // On Linux Kernels older than 5.4 this map type doesn't exist, but it can kind
+                // of be approximated: HASH has the same userspace visible api.
+                // However it cannot be used by ebpf programs in the same way.
+                // Since bpf_redirect_map() only requires 4.14, a program using a DEVMAP_HASH map
+                // would fail to load (due to trying to redirect to a HASH instead of DEVMAP_HASH).
+                // One must thus tag any BPF_MAP_TYPE_DEVMAP_HASH + bpf_redirect_map() using
+                // programs as being 5.4+...
+                type = BPF_MAP_TYPE_HASH;
+            }
+            fd.reset(bpf_create_map(type, mapNames[i].c_str(), md[i].key_size, md[i].value_size,
                                     md[i].max_entries, md[i].map_flags));
+            saved_errno = errno;
             ALOGD("bpf_create_map name %s, ret: %d\n", mapNames[i].c_str(), fd.get());
         }
 
-        if (fd < 0) return fd;
-        if (fd == 0) return -EINVAL;
+        if (fd < 0) return -saved_errno;
 
         if (!reuse) {
             ret = bpf_obj_pin(fd, mapPinLoc.c_str());
@@ -531,7 +563,8 @@ static void applyMapRelo(ifstream& elfFile, vector<unique_fd> &mapFds, vector<co
     }
 }
 
-static int loadCodeSections(const char* elfPath, vector<codeSection>& cs, const string& license) {
+static int loadCodeSections(const char* elfPath, vector<codeSection>& cs, const string& license,
+                            const char* prefix) {
     unsigned kvers = kernelVersion();
     int ret, fd;
 
@@ -558,8 +591,10 @@ static int loadCodeSections(const char* elfPath, vector<codeSection>& cs, const 
 
         bool reuse = false;
         // Format of pin location is
-        // /sys/fs/bpf/prog_<filename>_<mapname>
-        string progPinLoc = BPF_FS_PATH "prog_";
+        // /sys/fs/bpf/<prefix>prog_<filename>_<mapname>
+        string progPinLoc = BPF_FS_PATH;
+        progPinLoc += prefix;
+        progPinLoc += "prog_";
         progPinLoc += fname;
         progPinLoc += '_';
         progPinLoc += name;
@@ -578,7 +613,7 @@ static int loadCodeSections(const char* elfPath, vector<codeSection>& cs, const 
                   cs[i].name.c_str(), fd, (fd < 0 ? std::strerror(errno) : "no error"));
 
             if (fd < 0) {
-                std::vector<std::string> lines = android::base::Split(log_buf.data(), "\n");
+                vector<string> lines = android::base::Split(log_buf.data(), "\n");
 
                 ALOGW("bpf_prog_load - BEGIN log_buf contents:");
                 for (const auto& line : lines) ALOGW("%s", line.c_str());
@@ -613,7 +648,7 @@ static int loadCodeSections(const char* elfPath, vector<codeSection>& cs, const 
     return 0;
 }
 
-int loadProg(const char* elfPath, bool* isCritical) {
+int loadProg(const char* elfPath, bool* isCritical, const char* prefix) {
     vector<char> license;
     vector<char> critical;
     vector<codeSection> cs;
@@ -648,7 +683,7 @@ int loadProg(const char* elfPath, bool* isCritical) {
     /* Just for future debugging */
     if (0) dumpAllCs(cs);
 
-    ret = createMaps(elfPath, elfFile, mapFds);
+    ret = createMaps(elfPath, elfFile, mapFds, prefix);
     if (ret) {
         ALOGE("Failed to create maps: (ret=%d) in %s\n", ret, elfPath);
         return ret;
@@ -659,27 +694,10 @@ int loadProg(const char* elfPath, bool* isCritical) {
 
     applyMapRelo(elfFile, mapFds, cs);
 
-    ret = loadCodeSections(elfPath, cs, string(license.data()));
+    ret = loadCodeSections(elfPath, cs, string(license.data()), prefix);
     if (ret) ALOGE("Failed to load programs, loadCodeSections ret=%d\n", ret);
 
     return ret;
-}
-
-static bool waitSecondsForProgsLoaded(int seconds) {
-    bool ok =
-            android::base::WaitForProperty("bpf.progs_loaded", "1", std::chrono::seconds(seconds));
-    if (!ok) ALOGW("Waited %ds for bpf.progs_loaded, still waiting...", seconds);
-    return ok;
-}
-
-void waitForProgsLoaded() {
-    if (!android::bpf::isBpfSupported()) return;
-
-    if (waitSecondsForProgsLoaded(5)) return;
-    if (waitSecondsForProgsLoaded(10)) return;
-    if (waitSecondsForProgsLoaded(20)) return;
-    while (!waitSecondsForProgsLoaded(60))
-        ;  // loop until success
 }
 
 }  // namespace bpf

@@ -28,9 +28,9 @@
 #include <sys/utsname.h>
 #include <unistd.h>
 
-// This is BpfLoader v0.3
+// This is BpfLoader v0.5
 #define BPFLOADER_VERSION_MAJOR 0u
-#define BPFLOADER_VERSION_MINOR 3u
+#define BPFLOADER_VERSION_MINOR 5u
 #define BPFLOADER_VERSION ((BPFLOADER_VERSION_MAJOR << 16) | BPFLOADER_VERSION_MINOR)
 
 #include "../progs/include/bpf_map_def.h"
@@ -50,7 +50,7 @@
 #define BPF_FS_PATH "/sys/fs/bpf/"
 
 // Size of the BPF log buffer for verifier logging
-#define BPF_LOAD_LOG_SZ 0x1ffff
+#define BPF_LOAD_LOG_SZ 0xfffff
 
 using android::base::StartsWith;
 using android::base::unique_fd;
@@ -95,6 +95,7 @@ sectionType sectionNameTypes[] = {
         {"schedact", BPF_PROG_TYPE_SCHED_ACT},
         {"cgroupsock", BPF_PROG_TYPE_CGROUP_SOCK},
         {"xdp", BPF_PROG_TYPE_XDP},
+        {"cgroupsockaddr", BPF_PROG_TYPE_CGROUP_SOCK_ADDR},
 
         /* End of table */
         {"END", BPF_PROG_TYPE_UNSPEC},

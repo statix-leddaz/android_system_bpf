@@ -58,17 +58,17 @@ cc_library {
         "libbase",
         "libutils",
         "liblog",
-        "libbpf",
+        "libbpf_bcc",
     ],
     header_libs: [
-        "bpf_map_utils",
+        "bpf_headers",
         "libbpf_android_headers",
     ],
     export_header_lib_headers: [
         "libbpf_android_headers",
-        "bpf_map_utils",
+        "bpf_headers",
     ],
-    export_shared_lib_headers: ["libbpf"],
+    export_shared_lib_headers: ["libbpf_bcc"],
     local_include_dirs: ["include"],
 
     defaults: ["bpf_defaults"],
@@ -81,7 +81,7 @@ cc_library {
 
 cc_test {
     name: "libbpf_load_test",
-    header_libs: ["bpf_map_utils"],
+    header_libs: ["bpf_headers"],
     srcs: [
         "BpfLoadTest.cpp",
     ],
@@ -94,7 +94,7 @@ cc_test {
     static_libs: ["libgmock"],
     shared_libs: [
         "libbpf_android",
-        "libbpf",
+        "libbpf_bcc",
         "libbase",
         "liblog",
         "libutils",

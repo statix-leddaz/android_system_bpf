@@ -46,7 +46,6 @@ cc_library {
     target: {
         android: {
             srcs: [
-                "BpfUtils.cpp",
                 "Loader.cpp",
             ],
             sanitize: {
@@ -59,13 +58,17 @@ cc_library {
         "libbase",
         "libutils",
         "liblog",
-        "libbpf",
+        "libbpf_bcc",
     ],
     header_libs: [
-        "libbpf_android_headers"
+        "bpf_headers",
+        "libbpf_android_headers",
     ],
-    export_header_lib_headers: ["libbpf_android_headers"],
-    export_shared_lib_headers: ["libbpf"],
+    export_header_lib_headers: [
+        "libbpf_android_headers",
+        "bpf_headers",
+    ],
+    export_shared_lib_headers: ["libbpf_bcc"],
     local_include_dirs: ["include"],
 
     defaults: ["bpf_defaults"],
@@ -77,29 +80,8 @@ cc_library {
 }
 
 cc_test {
-    name: "libbpf_android_test",
-    srcs: [
-        "BpfMapTest.cpp",
-    ],
-    defaults: ["bpf_defaults"],
-    cflags: [
-        "-Wall",
-        "-Werror",
-        "-Wno-error=unused-variable",
-    ],
-    static_libs: ["libgmock"],
-    shared_libs: [
-        "libbpf_android",
-        "libbase",
-        "liblog",
-        "libutils",
-    ],
-    require_root: true,
-    test_suites: ["general-tests"],
-}
-
-cc_test {
     name: "libbpf_load_test",
+    header_libs: ["bpf_headers"],
     srcs: [
         "BpfLoadTest.cpp",
     ],
@@ -112,7 +94,7 @@ cc_test {
     static_libs: ["libgmock"],
     shared_libs: [
         "libbpf_android",
-        "libbpf",
+        "libbpf_bcc",
         "libbase",
         "liblog",
         "libutils",

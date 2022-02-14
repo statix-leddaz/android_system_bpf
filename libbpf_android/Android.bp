@@ -60,13 +60,13 @@ cc_library {
         "libutils",
         "libprocessgroup",
         "liblog",
-        "libbpf",
+        "libbpf_bcc",
     ],
     header_libs: [
         "libbpf_android_headers"
     ],
     export_header_lib_headers: ["libbpf_android_headers"],
-    export_shared_lib_headers: ["libbpf"],
+    export_shared_lib_headers: ["libbpf_bcc"],
     local_include_dirs: ["include"],
 
     defaults: ["bpf_defaults"],
@@ -75,28 +75,6 @@ cc_library {
         "-Wall",
         "-Wextra",
     ],
-}
-
-cc_test {
-    name: "libbpf_android_test",
-    srcs: [
-        "BpfMapTest.cpp",
-    ],
-    defaults: ["bpf_defaults"],
-    cflags: [
-        "-Wall",
-        "-Werror",
-        "-Wno-error=unused-variable",
-    ],
-    static_libs: ["libgmock"],
-    shared_libs: [
-        "libbpf_android",
-        "libbase",
-        "liblog",
-        "libutils",
-    ],
-    require_root: true,
-    test_suites: ["general-tests"],
 }
 
 cc_test {
@@ -113,7 +91,7 @@ cc_test {
     static_libs: ["libgmock"],
     shared_libs: [
         "libbpf_android",
-        "libbpf",
+        "libbpf_bcc",
         "libbase",
         "liblog",
         "libutils",

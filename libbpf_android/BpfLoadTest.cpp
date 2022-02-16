@@ -14,53 +14,38 @@
  * limitations under the License.
  */
 
-#include <android-base/file.h>
 #include <android-base/macros.h>
 #include <gtest/gtest.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <iostream>
-#include "bpf/BpfMap.h"
-#include "bpf/BpfUtils.h"
+#include "include/bpf/BpfMap.h"
+#include "include/bpf/BpfUtils.h"
 #include "include/libbpf_android.h"
 
-using ::testing::TestWithParam;
+using ::testing::Test;
+
+constexpr const char tp_prog_path[] =
+        "/sys/fs/bpf/prog_bpf_load_tp_prog_tracepoint_sched_sched_switch";
+constexpr const char tp_map_path[] = "/sys/fs/bpf/map_bpf_load_tp_prog_cpu_pid_map";
 
 namespace android {
 namespace bpf {
 
-class BpfLoadTest : public TestWithParam<std::string> {
+class BpfLoadTest : public testing::Test {
   protected:
     BpfLoadTest() {}
     int mProgFd;
-    std::string mTpProgPath;
-    std::string mTpNeverLoadProgPath;
-    std::string mTpMapPath;;
 
     void SetUp() {
-        mTpProgPath = "/sys/fs/bpf/prog_" + GetParam() + "_tracepoint_sched_sched_switch";
-        unlink(mTpProgPath.c_str());
+        unlink(tp_prog_path);
+        unlink(tp_map_path);
 
-        mTpNeverLoadProgPath = "/sys/fs/bpf/prog_" + GetParam() + "_tracepoint_sched_sched_wakeup";
-        unlink(mTpNeverLoadProgPath.c_str());
-
-        mTpMapPath = "/sys/fs/bpf/map_" + GetParam() + "_cpu_pid_map";
-        unlink(mTpMapPath.c_str());
-
-        auto progPath = android::base::GetExecutableDirectory() + "/" + GetParam() + ".o";
         bool critical = true;
-
-        bpf_prog_type kAllowed[] = {
-                BPF_PROG_TYPE_UNSPEC,
-        };
-        EXPECT_EQ(android::bpf::loadProg(progPath.c_str(), &critical, "", kAllowed,
-                                         arraysize(kAllowed)),
-                  -1);
-
-        EXPECT_EQ(android::bpf::loadProg(progPath.c_str(), &critical), 0);
+        EXPECT_EQ(android::bpf::loadProg("/system/etc/bpf/bpf_load_tp_prog.o", &critical), 0);
         EXPECT_EQ(false, critical);
 
-        mProgFd = bpf_obj_get(mTpProgPath.c_str());
+        mProgFd = bpf_obj_get(tp_prog_path);
         EXPECT_GT(mProgFd, 0);
 
         int ret = bpf_attach_tracepoint(mProgFd, "sched", "sched_switch");
@@ -69,14 +54,14 @@ class BpfLoadTest : public TestWithParam<std::string> {
 
     void TearDown() {
         close(mProgFd);
-        unlink(mTpProgPath.c_str());
-        unlink(mTpMapPath.c_str());
+        unlink(tp_prog_path);
+        unlink(tp_map_path);
     }
 
     void checkMapNonZero() {
         // The test program installs a tracepoint on sched:sched_switch
         // and expects the kernel to populate a PID corresponding to CPU
-        android::bpf::BpfMap<uint32_t, uint32_t> m(mTpMapPath.c_str());
+        android::bpf::BpfMap<uint32_t, uint32_t> m(tp_map_path);
 
         // Wait for program to run a little
         sleep(1);
@@ -96,38 +81,10 @@ class BpfLoadTest : public TestWithParam<std::string> {
         EXPECT_RESULT_OK(m.iterateWithValue(iterFunc));
         EXPECT_EQ(non_zero, 1);
     }
-
-    void checkMapBtf() {
-        // Earlier kernels lack BPF_BTF_LOAD support
-        if (!isAtLeastKernelVersion(4, 19, 0)) GTEST_SKIP() << "pre-4.19 kernel does not support BTF";
-
-        const bool haveBtf = GetParam().find("btf") != std::string::npos;
-
-        std::string str;
-        EXPECT_EQ(android::base::ReadFileToString(mTpMapPath, &str), haveBtf);
-        if (haveBtf) EXPECT_FALSE(str.empty());
-    }
-
-    void checkKernelVersionEnforced() {
-        EXPECT_EQ(bpf_obj_get(mTpNeverLoadProgPath.c_str()), -1);
-        EXPECT_EQ(errno, ENOENT);
-    }
 };
 
-INSTANTIATE_TEST_SUITE_P(BpfLoadTests, BpfLoadTest,
-                         ::testing::Values("bpf_load_tp_prog",
-                                           "bpf_load_tp_prog_btf"));
-
-TEST_P(BpfLoadTest, bpfCheckMap) {
+TEST_F(BpfLoadTest, bpfCheckMap) {
     checkMapNonZero();
-}
-
-TEST_P(BpfLoadTest, bpfCheckBtf) {
-    checkMapBtf();
-}
-
-TEST_P(BpfLoadTest, bpfCheckMinKernelVersionEnforced) {
-    checkKernelVersionEnforced();
 }
 
 }  // namespace bpf

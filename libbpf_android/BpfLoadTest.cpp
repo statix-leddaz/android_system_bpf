@@ -38,6 +38,8 @@ class BpfLoadTest : public testing::Test {
     int mProgFd;
 
     void SetUp() {
+        SKIP_IF_BPF_NOT_SUPPORTED;
+
         unlink(tp_prog_path);
         unlink(tp_map_path);
 
@@ -53,6 +55,8 @@ class BpfLoadTest : public testing::Test {
     }
 
     void TearDown() {
+        SKIP_IF_BPF_NOT_SUPPORTED;
+
         close(mProgFd);
         unlink(tp_prog_path);
         unlink(tp_map_path);
@@ -84,6 +88,8 @@ class BpfLoadTest : public testing::Test {
 };
 
 TEST_F(BpfLoadTest, bpfCheckMap) {
+    SKIP_IF_BPF_NOT_SUPPORTED;
+
     checkMapNonZero();
 }
 

@@ -1,6 +1,5 @@
 /*
  * Copyright (C) 2018 The Android Open Source Project
- * Android BPF library - public API
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,22 +14,24 @@
  * limitations under the License.
  */
 
-#ifndef LIBBPF_SYSTEM_H
-#define LIBBPF_SYSTEM_H
+#include <stdio.h>
+#include <iostream>
+#include <string>
+#include <vector>
 
-#include <libbpf.h>
-#include <linux/bpf.h>
+#include <android-base/strings.h>
 
-namespace android {
-namespace bpf {
+static std::string pathToFilename(const std::string& path, bool noext = false) {
+    std::vector<std::string> spath = android::base::Split(path, "/");
+    std::string ret = spath.back();
 
-// BPF loader implementation. Loads an eBPF ELF object
-int loadProg(const char* elfPath, bool* isCritical);
+    if (noext) {
+        size_t lastindex = ret.find_last_of('.');
+        return ret.substr(0, lastindex);
+    }
+    return ret;
+}
 
-// Wait for bpfloader to load BPF programs.
-void waitForProgsLoaded();
-
-}  // namespace bpf
-}  // namespace android
-
-#endif
+static void deslash(std::string& s) {
+    std::replace(s.begin(), s.end(), '/', '_');
+}

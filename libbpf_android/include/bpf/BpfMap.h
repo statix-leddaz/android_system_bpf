@@ -14,7 +14,8 @@
  * limitations under the License.
  */
 
-#pragma once
+#ifndef BPF_BPFMAP_H
+#define BPF_BPFMAP_H
 
 #include <linux/bpf.h>
 
@@ -133,11 +134,10 @@ class BpfMap {
         return *this;
     }
 
-    // Move assignment operator
-    BpfMap<Key, Value>& operator=(BpfMap<Key, Value>&& other) noexcept {
+    // Move constructor
+    void operator=(BpfMap<Key, Value>&& other) noexcept {
         mMapFd = std::move(other.mMapFd);
         other.reset(-1);
-        return *this;
     }
 
     void reset(base::unique_fd fd) = delete;
@@ -258,3 +258,5 @@ class BpfMapRO : public BpfMap<Key, Value> {
 
 }  // namespace bpf
 }  // namespace android
+
+#endif

@@ -30,9 +30,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-// This is BpfLoader v0.10
+// This is BpfLoader v0.12
 #define BPFLOADER_VERSION_MAJOR 0u
-#define BPFLOADER_VERSION_MINOR 10u
+#define BPFLOADER_VERSION_MINOR 12u
 #define BPFLOADER_VERSION ((BPFLOADER_VERSION_MAJOR << 16) | BPFLOADER_VERSION_MINOR)
 
 #include "bpf/BpfUtils.h"
@@ -312,16 +312,14 @@ static enum bpf_attach_type getExpectedAttachType(string& name) {
     return BPF_ATTACH_TYPE_UNSPEC;
 }
 
-/* If ever needed
 static string getSectionName(enum bpf_prog_type type)
 {
     for (auto& snt : sectionNameTypes)
         if (snt.type == type)
             return string(snt.name);
 
-    return NULL;
+    return "UNKNOWN SECTION NAME " + std::to_string(type);
 }
-*/
 
 static int readProgDefs(ifstream& elfFile, vector<struct bpf_prog_def>& pd,
                         size_t sizeOfBpfProgDef) {
@@ -401,8 +399,19 @@ static int getSectionSymNames(ifstream& elfFile, const string& sectionName, vect
     return 0;
 }
 
+static bool IsAllowed(bpf_prog_type type, const bpf_prog_type* allowed, size_t numAllowed) {
+    if (allowed == nullptr) return true;
+
+    for (size_t i = 0; i < numAllowed; i++) {
+        if (type == allowed[i]) return true;
+    }
+
+    return false;
+}
+
 /* Read a section by its index - for ex to get sec hdr strtab blob */
-static int readCodeSections(ifstream& elfFile, vector<codeSection>& cs, size_t sizeOfBpfProgDef) {
+static int readCodeSections(ifstream& elfFile, vector<codeSection>& cs, size_t sizeOfBpfProgDef,
+                            const bpf_prog_type* allowed, size_t numAllowed) {
     vector<Elf64_Shdr> shTable;
     int entries, ret = 0;
 
@@ -426,7 +435,13 @@ static int readCodeSections(ifstream& elfFile, vector<codeSection>& cs, size_t s
         if (ret) return ret;
 
         enum bpf_prog_type ptype = getSectionType(name);
+
         if (ptype == BPF_PROG_TYPE_UNSPEC) continue;
+
+        if (!IsAllowed(ptype, allowed, numAllowed)) {
+            ALOGE("Program type %s not permitted here", getSectionName(ptype).c_str());
+            return -1;
+        }
 
         // This must be done before '/' is replaced with '_'.
         cs_temp.expected_attach_type = getExpectedAttachType(name);
@@ -866,13 +881,13 @@ static int loadCodeSections(const char* elfPath, vector<codeSection>& cs, const 
         if (!reuse) {
             ret = bpf_obj_pin(fd, progPinLoc.c_str());
             if (ret) return -errno;
+            if (chmod(progPinLoc.c_str(), 0440)) return -errno;
             if (cs[i].prog_def.has_value()) {
                 if (chown(progPinLoc.c_str(), (uid_t)cs[i].prog_def->uid,
                           (gid_t)cs[i].prog_def->gid)) {
                     return -errno;
                 }
             }
-            if (chmod(progPinLoc.c_str(), 0440)) return -errno;
         }
 
         cs[i].prog_fd.reset(fd);
@@ -881,7 +896,8 @@ static int loadCodeSections(const char* elfPath, vector<codeSection>& cs, const 
     return 0;
 }
 
-int loadProg(const char* elfPath, bool* isCritical, const char* prefix) {
+int loadProg(const char* elfPath, bool* isCritical, const char* prefix,
+             const bpf_prog_type* allowed, size_t numAllowed) {
     vector<char> license;
     vector<char> critical;
     vector<codeSection> cs;
@@ -946,7 +962,7 @@ int loadProg(const char* elfPath, bool* isCritical, const char* prefix) {
         return -1;
     }
 
-    ret = readCodeSections(elfFile, cs, sizeOfBpfProgDef);
+    ret = readCodeSections(elfFile, cs, sizeOfBpfProgDef, allowed, numAllowed);
     if (ret) {
         ALOGE("Couldn't read all code sections in %s\n", elfPath);
         return ret;

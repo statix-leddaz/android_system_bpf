@@ -19,26 +19,16 @@
 
 #include <libbpf.h>
 #include <linux/bpf.h>
-#include <log/log.h>
-
-#include <android-base/properties.h>
 
 namespace android {
 namespace bpf {
 
 // BPF loader implementation. Loads an eBPF ELF object
-int loadProg(const char* elfPath, bool* isCritical, const char* prefix = "");
+int loadProg(const char* elfPath, bool* isCritical, const char* prefix = "",
+             const bpf_prog_type* allowed = nullptr, size_t numAllowed = 0);
 
-// Wait for bpfloader to load BPF programs.
-static inline void waitForProgsLoaded() {
-    // infinite loop until success with 5/10/20/40/60/60/60... delay
-    for (int delay = 5;; delay *= 2) {
-        if (delay > 60) delay = 60;
-        if (android::base::WaitForProperty("bpf.progs_loaded", "1", std::chrono::seconds(delay)))
-            return;
-        ALOGW("Waited %ds for bpf.progs_loaded, still waiting...", delay);
-    }
-}
+// Exposed for testing
+unsigned int readSectionUint(const char* name, std::ifstream& elfFile, unsigned int defVal);
 
 }  // namespace bpf
 }  // namespace android

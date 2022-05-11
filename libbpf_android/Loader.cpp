@@ -24,28 +24,43 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sysexits.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
-#include "../progs/include/bpf_map_def.h"
+// This is BpfLoader v0.12
+#define BPFLOADER_VERSION_MAJOR 0u
+#define BPFLOADER_VERSION_MINOR 12u
+#define BPFLOADER_VERSION ((BPFLOADER_VERSION_MAJOR << 16) | BPFLOADER_VERSION_MINOR)
+
 #include "bpf/BpfUtils.h"
+#include "bpf/bpf_map_def.h"
 #include "include/libbpf_android.h"
+
+#include <bpf/bpf.h>
 
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
+#include <android-base/cmsg.h>
+#include <android-base/file.h>
 #include <android-base/strings.h>
 #include <android-base/unique_fd.h>
 
 #define BPF_FS_PATH "/sys/fs/bpf/"
 
 // Size of the BPF log buffer for verifier logging
-#define BPF_LOAD_LOG_SZ 0x1ffff
+#define BPF_LOAD_LOG_SZ 0xfffff
+
+// Unspecified attach type is 0 which is BPF_CGROUP_INET_INGRESS.
+#define BPF_ATTACH_TYPE_UNSPEC BPF_CGROUP_INET_INGRESS
 
 using android::base::StartsWith;
 using android::base::unique_fd;
@@ -72,30 +87,35 @@ static string pathToFilename(const string& path, bool noext = false) {
 typedef struct {
     const char* name;
     enum bpf_prog_type type;
+    enum bpf_attach_type expected_attach_type;
 } sectionType;
 
 /*
  * Map section name prefixes to program types, the section name will be:
- * SEC(<prefix>/<name-of-program>)
+ *   SECTION(<prefix>/<name-of-program>)
  * For example:
- * SEC("tracepoint/sched_switch_func") where sched_switch_funcs
+ *   SECTION("tracepoint/sched_switch_func") where sched_switch_funcs
  * is the name of the program, and tracepoint is the type.
+ *
+ * However, be aware that you should not be directly using the SECTION() macro.
+ * Instead use the DEFINE_(BPF|XDP)_(PROG|MAP)... & LICENSE/CRITICAL macros.
  */
 sectionType sectionNameTypes[] = {
-        {"kprobe", BPF_PROG_TYPE_KPROBE},
-        {"tracepoint", BPF_PROG_TYPE_TRACEPOINT},
-        {"skfilter", BPF_PROG_TYPE_SOCKET_FILTER},
-        {"cgroupskb", BPF_PROG_TYPE_CGROUP_SKB},
-        {"schedcls", BPF_PROG_TYPE_SCHED_CLS},
-        {"cgroupsock", BPF_PROG_TYPE_CGROUP_SOCK},
-        {"xdp", BPF_PROG_TYPE_XDP},
-
-        /* End of table */
-        {"END", BPF_PROG_TYPE_UNSPEC},
+        {"bind4/", BPF_PROG_TYPE_CGROUP_SOCK_ADDR, BPF_CGROUP_INET4_BIND},
+        {"bind6/", BPF_PROG_TYPE_CGROUP_SOCK_ADDR, BPF_CGROUP_INET6_BIND},
+        {"cgroupskb/", BPF_PROG_TYPE_CGROUP_SKB, BPF_ATTACH_TYPE_UNSPEC},
+        {"cgroupsock/", BPF_PROG_TYPE_CGROUP_SOCK, BPF_ATTACH_TYPE_UNSPEC},
+        {"kprobe/", BPF_PROG_TYPE_KPROBE, BPF_ATTACH_TYPE_UNSPEC},
+        {"schedact/", BPF_PROG_TYPE_SCHED_ACT, BPF_ATTACH_TYPE_UNSPEC},
+        {"schedcls/", BPF_PROG_TYPE_SCHED_CLS, BPF_ATTACH_TYPE_UNSPEC},
+        {"skfilter/", BPF_PROG_TYPE_SOCKET_FILTER, BPF_ATTACH_TYPE_UNSPEC},
+        {"tracepoint/", BPF_PROG_TYPE_TRACEPOINT, BPF_ATTACH_TYPE_UNSPEC},
+        {"xdp/", BPF_PROG_TYPE_XDP, BPF_ATTACH_TYPE_UNSPEC},
 };
 
 typedef struct {
     enum bpf_prog_type type;
+    enum bpf_attach_type expected_attach_type;
     string name;
     vector<char> data;
     vector<char> rel_data;
@@ -205,6 +225,29 @@ static int readSectionByName(const char* name, ifstream& elfFile, vector<char>& 
     return -2;
 }
 
+unsigned int readSectionUint(const char* name, ifstream& elfFile, unsigned int defVal) {
+    vector<char> theBytes;
+    int ret = readSectionByName(name, elfFile, theBytes);
+    if (ret) {
+        ALOGD("Couldn't find section %s (defaulting to %u [0x%x]).\n", name, defVal, defVal);
+        return defVal;
+    } else if (theBytes.size() < sizeof(unsigned int)) {
+        ALOGE("Section %s too short (defaulting to %u [0x%x]).\n", name, defVal, defVal);
+        return defVal;
+    } else {
+        // decode first 4 bytes as LE32 uint, there will likely be more bytes due to alignment.
+        unsigned int value = static_cast<unsigned char>(theBytes[3]);
+        value <<= 8;
+        value += static_cast<unsigned char>(theBytes[2]);
+        value <<= 8;
+        value += static_cast<unsigned char>(theBytes[1]);
+        value <<= 8;
+        value += static_cast<unsigned char>(theBytes[0]);
+        ALOGI("Section %s value is %u [0x%x]\n", name, value, value);
+        return value;
+    }
+}
+
 static int readSectionByType(ifstream& elfFile, int type, vector<char>& data) {
     int ret;
     vector<Elf64_Shdr> shTable;
@@ -250,49 +293,69 @@ static int readSymTab(ifstream& elfFile, int sort, vector<Elf64_Sym>& data) {
 }
 
 static enum bpf_prog_type getSectionType(string& name) {
-    for (int i = 0; sectionNameTypes[i].type != BPF_PROG_TYPE_UNSPEC; i++)
-        if (StartsWith(name, sectionNameTypes[i].name)) return sectionNameTypes[i].type;
+    for (auto& snt : sectionNameTypes)
+        if (StartsWith(name, snt.name)) return snt.type;
+
+    // TODO Remove this code when fuse-bpf is upstream and this BPF_PROG_TYPE_FUSE is fixed
+    if (StartsWith(name, "fuse/")) {
+        int result = BPF_PROG_TYPE_UNSPEC;
+        ifstream("/sys/fs/fuse/bpf_prog_type_fuse") >> result;
+        return static_cast<bpf_prog_type>(result);
+    }
 
     return BPF_PROG_TYPE_UNSPEC;
 }
 
-/* If ever needed
+static enum bpf_attach_type getExpectedAttachType(string& name) {
+    for (auto& snt : sectionNameTypes)
+        if (StartsWith(name, snt.name)) return snt.expected_attach_type;
+    return BPF_ATTACH_TYPE_UNSPEC;
+}
+
 static string getSectionName(enum bpf_prog_type type)
 {
-    for (int i = 0; sectionNameTypes[i].type != BPF_PROG_TYPE_UNSPEC; i++)
-        if (sectionNameTypes[i].type == type)
-            return string(sectionNameTypes[i].name);
+    for (auto& snt : sectionNameTypes)
+        if (snt.type == type)
+            return string(snt.name);
 
-    return NULL;
-}
-*/
-
-static bool isRelSection(codeSection& cs, string& name) {
-    for (int i = 0; sectionNameTypes[i].type != BPF_PROG_TYPE_UNSPEC; i++) {
-        sectionType st = sectionNameTypes[i];
-
-        if (st.type != cs.type) continue;
-
-        if (StartsWith(name, string(".rel") + st.name + "/"))
-            return true;
-        else
-            return false;
-    }
-    return false;
+    return "UNKNOWN SECTION NAME " + std::to_string(type);
 }
 
-static int readProgDefs(ifstream& elfFile, vector<struct bpf_prog_def>& pd) {
+static int readProgDefs(ifstream& elfFile, vector<struct bpf_prog_def>& pd,
+                        size_t sizeOfBpfProgDef) {
     vector<char> pdData;
     int ret = readSectionByName("progs", elfFile, pdData);
+    // Older file formats do not require a 'progs' section at all.
+    // (We should probably figure out whether this is behaviour which is safe to remove now.)
     if (ret == -2) return 0;
     if (ret) return ret;
 
-    pd.resize(pdData.size() / sizeof(struct bpf_prog_def));
-    memcpy(pd.data(), pdData.data(), pdData.size());
+    if (pdData.size() % sizeOfBpfProgDef) {
+        ALOGE("readProgDefs failed due to improper sized progs section, %zu %% %zu != 0\n",
+              pdData.size(), sizeOfBpfProgDef);
+        return -1;
+    };
+
+    int progCount = pdData.size() / sizeOfBpfProgDef;
+    pd.resize(progCount);
+    size_t trimmedSize = std::min(sizeOfBpfProgDef, sizeof(struct bpf_prog_def));
+
+    const char* dataPtr = pdData.data();
+    for (auto& p : pd) {
+        // First we zero initialize
+        memset(&p, 0, sizeof(p));
+        // Then we set non-zero defaults
+        p.bpfloader_max_ver = DEFAULT_BPFLOADER_MAX_VER;  // v1.0
+        // Then we copy over the structure prefix from the ELF file.
+        memcpy(&p, dataPtr, trimmedSize);
+        // Move to next struct in the ELF file
+        dataPtr += sizeOfBpfProgDef;
+    }
     return 0;
 }
 
-static int getSectionSymNames(ifstream& elfFile, const string& sectionName, vector<string>& names) {
+static int getSectionSymNames(ifstream& elfFile, const string& sectionName, vector<string>& names,
+                              optional<unsigned> symbolType = std::nullopt) {
     int ret;
     string name;
     vector<Elf64_Sym> symtab;
@@ -323,6 +386,8 @@ static int getSectionSymNames(ifstream& elfFile, const string& sectionName, vect
     }
 
     for (int i = 0; i < (int)symtab.size(); i++) {
+        if (symbolType.has_value() && ELF_ST_TYPE(symtab[i].st_info) != symbolType) continue;
+
         if (symtab[i].st_shndx == sec_idx) {
             string s;
             ret = getSymName(elfFile, symtab[i].st_name, s);
@@ -334,8 +399,19 @@ static int getSectionSymNames(ifstream& elfFile, const string& sectionName, vect
     return 0;
 }
 
+static bool IsAllowed(bpf_prog_type type, const bpf_prog_type* allowed, size_t numAllowed) {
+    if (allowed == nullptr) return true;
+
+    for (size_t i = 0; i < numAllowed; i++) {
+        if (type == allowed[i]) return true;
+    }
+
+    return false;
+}
+
 /* Read a section by its index - for ex to get sec hdr strtab blob */
-static int readCodeSections(ifstream& elfFile, vector<codeSection>& cs) {
+static int readCodeSections(ifstream& elfFile, vector<codeSection>& cs, size_t sizeOfBpfProgDef,
+                            const bpf_prog_type* allowed, size_t numAllowed) {
     vector<Elf64_Shdr> shTable;
     int entries, ret = 0;
 
@@ -344,7 +420,7 @@ static int readCodeSections(ifstream& elfFile, vector<codeSection>& cs) {
     entries = shTable.size();
 
     vector<struct bpf_prog_def> pd;
-    ret = readProgDefs(elfFile, pd);
+    ret = readProgDefs(elfFile, pd, sizeOfBpfProgDef);
     if (ret) return ret;
     vector<string> progDefNames;
     ret = getSectionSymNames(elfFile, "progs", progDefNames);
@@ -359,27 +435,36 @@ static int readCodeSections(ifstream& elfFile, vector<codeSection>& cs) {
         if (ret) return ret;
 
         enum bpf_prog_type ptype = getSectionType(name);
-        if (ptype != BPF_PROG_TYPE_UNSPEC) {
-            string oldName = name;
 
-            // convert all slashes to underscores
-            std::replace(name.begin(), name.end(), '/', '_');
+        if (ptype == BPF_PROG_TYPE_UNSPEC) continue;
 
-            cs_temp.type = ptype;
-            cs_temp.name = name;
+        if (!IsAllowed(ptype, allowed, numAllowed)) {
+            ALOGE("Program type %s not permitted here", getSectionName(ptype).c_str());
+            return -1;
+        }
 
-            ret = readSectionByIdx(elfFile, i, cs_temp.data);
-            if (ret) return ret;
-            ALOGD("Loaded code section %d (%s)\n", i, name.c_str());
+        // This must be done before '/' is replaced with '_'.
+        cs_temp.expected_attach_type = getExpectedAttachType(name);
 
-            vector<string> csSymNames;
-            ret = getSectionSymNames(elfFile, oldName, csSymNames);
-            if (ret || !csSymNames.size()) return ret;
-            for (size_t i = 0; i < progDefNames.size(); ++i) {
-                if (!progDefNames[i].compare(csSymNames[0] + "_def")) {
-                    cs_temp.prog_def = pd[i];
-                    break;
-                }
+        string oldName = name;
+
+        // convert all slashes to underscores
+        std::replace(name.begin(), name.end(), '/', '_');
+
+        cs_temp.type = ptype;
+        cs_temp.name = name;
+
+        ret = readSectionByIdx(elfFile, i, cs_temp.data);
+        if (ret) return ret;
+        ALOGD("Loaded code section %d (%s)\n", i, name.c_str());
+
+        vector<string> csSymNames;
+        ret = getSectionSymNames(elfFile, oldName, csSymNames, STT_FUNC);
+        if (ret || !csSymNames.size()) return ret;
+        for (size_t i = 0; i < progDefNames.size(); ++i) {
+            if (!progDefNames[i].compare(csSymNames[0] + "_def")) {
+                cs_temp.prog_def = pd[i];
+                break;
             }
         }
 
@@ -388,7 +473,7 @@ static int readCodeSections(ifstream& elfFile, vector<codeSection>& cs) {
             ret = getSymName(elfFile, shTable[i + 1].sh_name, name);
             if (ret) return ret;
 
-            if (isRelSection(cs_temp, name)) {
+            if (name == (".rel" + oldName)) {
                 ret = readSectionByIdx(elfFile, i + 1, cs_temp.rel_data);
                 if (ret) return ret;
                 ALOGD("Loaded relo section %d (%s)\n", i, name.c_str());
@@ -415,31 +500,163 @@ static int getSymNameByIdx(ifstream& elfFile, int index, string& name) {
     return getSymName(elfFile, symtab[index].st_name, name);
 }
 
+static bool waitpidTimeout(pid_t pid, int timeoutMs) {
+    // Add SIGCHLD to the signal set.
+    sigset_t child_mask, original_mask;
+    sigemptyset(&child_mask);
+    sigaddset(&child_mask, SIGCHLD);
+    if (sigprocmask(SIG_BLOCK, &child_mask, &original_mask) == -1) return false;
+
+    // Wait for a SIGCHLD notification.
+    errno = 0;
+    timespec ts = {0, timeoutMs * 1000000};
+    int wait_result = TEMP_FAILURE_RETRY(sigtimedwait(&child_mask, nullptr, &ts));
+
+    // Restore the original signal set.
+    sigprocmask(SIG_SETMASK, &original_mask, nullptr);
+
+    if (wait_result == -1) return false;
+
+    int status;
+    return TEMP_FAILURE_RETRY(waitpid(pid, &status, WNOHANG)) == pid;
+}
+
+static std::optional<unique_fd> getMapBtfInfo(const char* elfPath,
+                         std::unordered_map<string, std::pair<uint32_t, uint32_t>> &btfTypeIds) {
+    unique_fd bpfloaderSocket, btfloaderSocket;
+    if (!android::base::Socketpair(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK, 0, &bpfloaderSocket,
+                                   &btfloaderSocket)) {
+        return {};
+    }
+
+    unique_fd pipeRead, pipeWrite;
+    if (!android::base::Pipe(&pipeRead, &pipeWrite, O_NONBLOCK)) {
+        return {};
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) return {};
+    if (!pid) {
+        bpfloaderSocket.reset();
+        pipeRead.reset();
+        auto socketFdStr = std::to_string(btfloaderSocket.release());
+        auto pipeFdStr = std::to_string(pipeWrite.release());
+
+        if (execl("/system/bin/btfloader", "/system/bin/btfloader", socketFdStr.c_str(),
+                  pipeFdStr.c_str(), elfPath, NULL) == -1) {
+            ALOGW("exec btfloader failed with errno %d (%s)\n", errno, strerror(errno));
+            exit(EX_UNAVAILABLE);
+        }
+    }
+    btfloaderSocket.reset();
+    pipeWrite.reset();
+    if (!waitpidTimeout(pid, 100)) {
+        kill(pid, SIGKILL);
+        return {};
+    }
+
+    unique_fd btfFd;
+    if (android::base::ReceiveFileDescriptors(bpfloaderSocket, nullptr, 0, &btfFd)) return {};
+
+    std::string btfTypeIdStr;
+    if (!android::base::ReadFdToString(pipeRead, &btfTypeIdStr)) return {};
+    if (btfFd.get() < 0) return {};
+
+    const auto mapTypeIdLines = android::base::Split(btfTypeIdStr, "\n");
+    for (const auto &line : mapTypeIdLines) {
+        const auto vec = android::base::Split(line, " ");
+        // Splitting on newline will give us one empty line
+        if (vec.size() != 3) continue;
+        const int kTid = atoi(vec[1].c_str());
+        const int vTid = atoi(vec[2].c_str());
+        if (!kTid || !vTid) return {};
+        btfTypeIds[vec[0]] = std::make_pair(kTid, vTid);
+    }
+    return btfFd;
+}
+
 static int createMaps(const char* elfPath, ifstream& elfFile, vector<unique_fd>& mapFds,
-                      const char* prefix) {
+                      const char* prefix, size_t sizeOfBpfMapDef) {
     int ret;
-    vector<char> mdData;
+    vector<char> mdData, btfData;
     vector<struct bpf_map_def> md;
     vector<string> mapNames;
+    std::unordered_map<string, std::pair<uint32_t, uint32_t>> btfTypeIdMap;
     string fname = pathToFilename(string(elfPath), true);
 
     ret = readSectionByName("maps", elfFile, mdData);
     if (ret == -2) return 0;  // no maps to read
     if (ret) return ret;
-    md.resize(mdData.size() / sizeof(struct bpf_map_def));
-    memcpy(md.data(), mdData.data(), mdData.size());
+
+    if (mdData.size() % sizeOfBpfMapDef) {
+        ALOGE("createMaps failed due to improper sized maps section, %zu %% %zu != 0\n",
+              mdData.size(), sizeOfBpfMapDef);
+        return -1;
+    };
+
+    int mapCount = mdData.size() / sizeOfBpfMapDef;
+    md.resize(mapCount);
+    size_t trimmedSize = std::min(sizeOfBpfMapDef, sizeof(struct bpf_map_def));
+
+    const char* dataPtr = mdData.data();
+    for (auto& m : md) {
+        // First we zero initialize
+        memset(&m, 0, sizeof(m));
+        // Then we set non-zero defaults
+        m.bpfloader_max_ver = DEFAULT_BPFLOADER_MAX_VER;  // v1.0
+        m.max_kver = 0xFFFFFFFFu;                         // matches KVER_INF from bpf_helpers.h
+        // Then we copy over the structure prefix from the ELF file.
+        memcpy(&m, dataPtr, trimmedSize);
+        // Move to next struct in the ELF file
+        dataPtr += sizeOfBpfMapDef;
+    }
 
     ret = getSectionSymNames(elfFile, "maps", mapNames);
     if (ret) return ret;
 
+    std::optional<unique_fd> btfFd;
+    if (!readSectionByName(".BTF", elfFile, btfData)) {
+        btfFd = getMapBtfInfo(elfPath, btfTypeIdMap);
+    }
+
+    unsigned kvers = kernelVersion();
+
     for (int i = 0; i < (int)mapNames.size(); i++) {
+        if (BPFLOADER_VERSION < md[i].bpfloader_min_ver) {
+            ALOGI("skipping map %s which requires bpfloader min ver 0x%05x\n", mapNames[i].c_str(),
+                  md[i].bpfloader_min_ver);
+            mapFds.push_back(unique_fd());
+            continue;
+        }
+
+        if (BPFLOADER_VERSION >= md[i].bpfloader_max_ver) {
+            ALOGI("skipping map %s which requires bpfloader max ver 0x%05x\n", mapNames[i].c_str(),
+                  md[i].bpfloader_max_ver);
+            mapFds.push_back(unique_fd());
+            continue;
+        }
+
+        if (kvers < md[i].min_kver) {
+            ALOGI("skipping map %s which requires kernel version 0x%x >= 0x%x\n",
+                  mapNames[i].c_str(), kvers, md[i].min_kver);
+            mapFds.push_back(unique_fd());
+            continue;
+        }
+
+        if (kvers >= md[i].max_kver) {
+            ALOGI("skipping map %s which requires kernel version 0x%x < 0x%x\n",
+                  mapNames[i].c_str(), kvers, md[i].max_kver);
+            mapFds.push_back(unique_fd());
+            continue;
+        }
+
+        // Format of pin location is /sys/fs/bpf/<prefix>map_<filename>_<mapname>
+        string mapPinLoc =
+                string(BPF_FS_PATH) + prefix + "map_" + fname + "_" + string(mapNames[i]);
+        bool reuse = false;
         unique_fd fd;
         int saved_errno;
-        // Format of pin location is /sys/fs/bpf/<prefix>map_<filename>_<mapname>
-        string mapPinLoc;
-        bool reuse = false;
 
-        mapPinLoc = string(BPF_FS_PATH) + prefix + "map_" + fname + "_" + string(mapNames[i]);
         if (access(mapPinLoc.c_str(), F_OK) == 0) {
             fd.reset(bpf_obj_get(mapPinLoc.c_str()));
             saved_errno = errno;
@@ -467,8 +684,20 @@ static int createMaps(const char* elfPath, ifstream& elfFile, vector<unique_fd>&
                 // programs as being 5.4+...
                 type = BPF_MAP_TYPE_HASH;
             }
-            fd.reset(bpf_create_map(type, mapNames[i].c_str(), md[i].key_size, md[i].value_size,
-                                    md[i].max_entries, md[i].map_flags));
+            struct bpf_create_map_attr attr = {
+                .name = mapNames[i].c_str(),
+                .map_type = type,
+                .map_flags = md[i].map_flags,
+                .key_size = md[i].key_size,
+                .value_size = md[i].value_size,
+                .max_entries = md[i].max_entries,
+            };
+            if (btfFd.has_value() && btfTypeIdMap.find(mapNames[i]) != btfTypeIdMap.end()) {
+                attr.btf_fd = btfFd->get();
+                attr.btf_key_type_id = btfTypeIdMap.at(mapNames[i]).first;
+                attr.btf_value_type_id = btfTypeIdMap.at(mapNames[i]).second;
+            }
+            fd.reset(bcc_create_map_xattr(&attr, true));
             saved_errno = errno;
             ALOGD("bpf_create_map name %s, ret: %d\n", mapNames[i].c_str(), fd.get());
         }
@@ -574,6 +803,8 @@ static int loadCodeSections(const char* elfPath, vector<codeSection>& cs, const 
 
     for (int i = 0; i < (int)cs.size(); i++) {
         string name = cs[i].name;
+        unsigned bpfMinVer = DEFAULT_BPFLOADER_MIN_VER;  // v0.0
+        unsigned bpfMaxVer = DEFAULT_BPFLOADER_MAX_VER;  // v1.0
 
         if (cs[i].prog_def.has_value()) {
             unsigned min_kver = cs[i].prog_def->min_kver;
@@ -582,7 +813,15 @@ static int loadCodeSections(const char* elfPath, vector<codeSection>& cs, const 
                   max_kver, kvers);
             if (kvers < min_kver) continue;
             if (kvers >= max_kver) continue;
+
+            bpfMinVer = cs[i].prog_def->bpfloader_min_ver;
+            bpfMaxVer = cs[i].prog_def->bpfloader_max_ver;
         }
+
+        ALOGD("cs[%d].name:%s requires bpfloader version [0x%05x,0x%05x)\n", i, name.c_str(),
+              bpfMinVer, bpfMaxVer);
+        if (BPFLOADER_VERSION < bpfMinVer) continue;
+        if (BPFLOADER_VERSION >= bpfMaxVer) continue;
 
         // strip any potential $foo suffix
         // this can be used to provide duplicate programs
@@ -606,9 +845,18 @@ static int loadCodeSections(const char* elfPath, vector<codeSection>& cs, const 
         } else {
             vector<char> log_buf(BPF_LOAD_LOG_SZ, 0);
 
-            fd = bpf_prog_load(cs[i].type, name.c_str(), (struct bpf_insn*)cs[i].data.data(),
-                               cs[i].data.size(), license.c_str(), kvers, 0, log_buf.data(),
-                               log_buf.size());
+            struct bpf_load_program_attr attr = {
+                .prog_type = cs[i].type,
+                .name = name.c_str(),
+                .insns = (struct bpf_insn*)cs[i].data.data(),
+                .license = license.c_str(),
+                .log_level = 0,
+                .expected_attach_type = cs[i].expected_attach_type,
+            };
+
+            fd = bcc_prog_load_xattr(&attr, cs[i].data.size(), log_buf.data(), log_buf.size(),
+                    true);
+
             ALOGD("bpf_prog_load lib call for %s (%s) returned fd: %d (%s)\n", elfPath,
                   cs[i].name.c_str(), fd, (fd < 0 ? std::strerror(errno) : "no error"));
 
@@ -633,13 +881,13 @@ static int loadCodeSections(const char* elfPath, vector<codeSection>& cs, const 
         if (!reuse) {
             ret = bpf_obj_pin(fd, progPinLoc.c_str());
             if (ret) return -errno;
+            if (chmod(progPinLoc.c_str(), 0440)) return -errno;
             if (cs[i].prog_def.has_value()) {
                 if (chown(progPinLoc.c_str(), (uid_t)cs[i].prog_def->uid,
                           (gid_t)cs[i].prog_def->gid)) {
                     return -errno;
                 }
             }
-            if (chmod(progPinLoc.c_str(), 0440)) return -errno;
         }
 
         cs[i].prog_fd.reset(fd);
@@ -648,7 +896,8 @@ static int loadCodeSections(const char* elfPath, vector<codeSection>& cs, const 
     return 0;
 }
 
-int loadProg(const char* elfPath, bool* isCritical, const char* prefix) {
+int loadProg(const char* elfPath, bool* isCritical, const char* prefix,
+             const bpf_prog_type* allowed, size_t numAllowed) {
     vector<char> license;
     vector<char> critical;
     vector<codeSection> cs;
@@ -674,7 +923,46 @@ int loadProg(const char* elfPath, bool* isCritical, const char* prefix) {
               elfPath, (char*)license.data());
     }
 
-    ret = readCodeSections(elfFile, cs);
+    // the following default values are for bpfloader V0.0 format which does not include them
+    unsigned int bpfLoaderMinVer =
+            readSectionUint("bpfloader_min_ver", elfFile, DEFAULT_BPFLOADER_MIN_VER);
+    unsigned int bpfLoaderMaxVer =
+            readSectionUint("bpfloader_max_ver", elfFile, DEFAULT_BPFLOADER_MAX_VER);
+    size_t sizeOfBpfMapDef =
+            readSectionUint("size_of_bpf_map_def", elfFile, DEFAULT_SIZEOF_BPF_MAP_DEF);
+    size_t sizeOfBpfProgDef =
+            readSectionUint("size_of_bpf_prog_def", elfFile, DEFAULT_SIZEOF_BPF_PROG_DEF);
+
+    // inclusive lower bound check
+    if (BPFLOADER_VERSION < bpfLoaderMinVer) {
+        ALOGI("BpfLoader version 0x%05x ignoring ELF object %s with min ver 0x%05x\n",
+              BPFLOADER_VERSION, elfPath, bpfLoaderMinVer);
+        return 0;
+    }
+
+    // exclusive upper bound check
+    if (BPFLOADER_VERSION >= bpfLoaderMaxVer) {
+        ALOGI("BpfLoader version 0x%05x ignoring ELF object %s with max ver 0x%05x\n",
+              BPFLOADER_VERSION, elfPath, bpfLoaderMaxVer);
+        return 0;
+    }
+
+    ALOGI("BpfLoader version 0x%05x processing ELF object %s with ver [0x%05x,0x%05x)\n",
+          BPFLOADER_VERSION, elfPath, bpfLoaderMinVer, bpfLoaderMaxVer);
+
+    if (sizeOfBpfMapDef < DEFAULT_SIZEOF_BPF_MAP_DEF) {
+        ALOGE("sizeof(bpf_map_def) of %zu is too small (< %d)\n", sizeOfBpfMapDef,
+              DEFAULT_SIZEOF_BPF_MAP_DEF);
+        return -1;
+    }
+
+    if (sizeOfBpfProgDef < DEFAULT_SIZEOF_BPF_PROG_DEF) {
+        ALOGE("sizeof(bpf_prog_def) of %zu is too small (< %d)\n", sizeOfBpfProgDef,
+              DEFAULT_SIZEOF_BPF_PROG_DEF);
+        return -1;
+    }
+
+    ret = readCodeSections(elfFile, cs, sizeOfBpfProgDef, allowed, numAllowed);
     if (ret) {
         ALOGE("Couldn't read all code sections in %s\n", elfPath);
         return ret;
@@ -683,7 +971,7 @@ int loadProg(const char* elfPath, bool* isCritical, const char* prefix) {
     /* Just for future debugging */
     if (0) dumpAllCs(cs);
 
-    ret = createMaps(elfPath, elfFile, mapFds, prefix);
+    ret = createMaps(elfPath, elfFile, mapFds, prefix, sizeOfBpfMapDef);
     if (ret) {
         ALOGE("Failed to create maps: (ret=%d) in %s\n", ret, elfPath);
         return ret;

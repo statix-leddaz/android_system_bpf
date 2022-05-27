@@ -30,9 +30,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-// This is BpfLoader v0.13
+// This is BpfLoader v0.15
 #define BPFLOADER_VERSION_MAJOR 0u
-#define BPFLOADER_VERSION_MINOR 13u
+#define BPFLOADER_VERSION_MINOR 15u
 #define BPFLOADER_VERSION ((BPFLOADER_VERSION_MAJOR << 16) | BPFLOADER_VERSION_MINOR)
 
 #include "bpf/BpfUtils.h"
@@ -106,6 +106,7 @@ sectionType sectionNameTypes[] = {
         {"cgroupskb/", BPF_PROG_TYPE_CGROUP_SKB, BPF_ATTACH_TYPE_UNSPEC},
         {"cgroupsock/", BPF_PROG_TYPE_CGROUP_SOCK, BPF_ATTACH_TYPE_UNSPEC},
         {"kprobe/", BPF_PROG_TYPE_KPROBE, BPF_ATTACH_TYPE_UNSPEC},
+        {"perf_event/", BPF_PROG_TYPE_PERF_EVENT, BPF_ATTACH_TYPE_UNSPEC},
         {"schedact/", BPF_PROG_TYPE_SCHED_ACT, BPF_ATTACH_TYPE_UNSPEC},
         {"schedcls/", BPF_PROG_TYPE_SCHED_CLS, BPF_ATTACH_TYPE_UNSPEC},
         {"skfilter/", BPF_PROG_TYPE_SOCKET_FILTER, BPF_ATTACH_TYPE_UNSPEC},
@@ -713,6 +714,15 @@ static int createMaps(const char* elfPath, ifstream& elfFile, vector<unique_fd>&
             if (ret) return -errno;
         }
 
+        struct bpf_map_info map_info = {};
+        __u32 map_info_len = sizeof(map_info);
+        int rv = bpf_obj_get_info_by_fd(fd, &map_info, &map_info_len);
+        if (rv) {
+            ALOGE("bpf_obj_get_info_by_fd failed, ret: %d [%d]\n", rv, errno);
+        } else {
+            ALOGI("map %s id %d\n", mapPinLoc.c_str(), map_info.id);
+        }
+
         mapFds.push_back(std::move(fd));
     }
 
@@ -888,6 +898,15 @@ static int loadCodeSections(const char* elfPath, vector<codeSection>& cs, const 
                     return -errno;
                 }
             }
+        }
+
+        struct bpf_prog_info prog_info = {};
+        __u32 prog_info_len = sizeof(prog_info);
+        int rv = bpf_obj_get_info_by_fd(fd, &prog_info, &prog_info_len);
+        if (rv) {
+            ALOGE("bpf_obj_get_info_by_fd failed, ret: %d [%d]\n", rv, errno);
+        } else {
+            ALOGI("prog %s id %d\n", progPinLoc.c_str(), prog_info.id);
         }
 
         cs[i].prog_fd.reset(fd);

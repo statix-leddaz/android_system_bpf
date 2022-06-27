@@ -30,9 +30,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-// This is BpfLoader v0.17
+// This is BpfLoader v0.19
 #define BPFLOADER_VERSION_MAJOR 0u
-#define BPFLOADER_VERSION_MINOR 17u
+#define BPFLOADER_VERSION_MINOR 19u
 #define BPFLOADER_VERSION ((BPFLOADER_VERSION_MAJOR << 16) | BPFLOADER_VERSION_MINOR)
 
 #include "bpf/BpfUtils.h"
@@ -72,6 +72,68 @@ using std::vector;
 
 namespace android {
 namespace bpf {
+
+constexpr const char* lookupSelinuxContext(const domain d, const char* const unspecified = "") {
+    switch (d) {
+        case domain::unspecified:   return unspecified;
+        case domain::platform:      return "fs_bpf";
+        case domain::tethering:     return "fs_bpf_tethering";
+        case domain::net_private:   return "fs_bpf_net_private";
+        case domain::net_shared:    return "fs_bpf_net_shared";
+        case domain::netd_readonly: return "fs_bpf_netd_readonly";
+        case domain::netd_shared:   return "fs_bpf_netd_shared";
+        case domain::vendor:        return "fs_bpf_vendor";
+        default:                    return "(unrecognized)";
+    }
+}
+
+domain getDomainFromSelinuxContext(const char s[BPF_SELINUX_CONTEXT_CHAR_ARRAY_SIZE]) {
+    for (domain d : AllDomains) {
+        // Not sure how to enforce this at compile time, so abort() bpfloader at boot instead
+        if (strlen(lookupSelinuxContext(d)) >= BPF_SELINUX_CONTEXT_CHAR_ARRAY_SIZE) abort();
+        if (!strncmp(s, lookupSelinuxContext(d), BPF_SELINUX_CONTEXT_CHAR_ARRAY_SIZE)) return d;
+    }
+    ALOGW("ignoring unrecognized selinux_context '%32s'", s);
+    // We should return 'unrecognized' here, however: returning unspecified will
+    // result in the system simply using the default context, which in turn
+    // will allow future expansion by adding more restrictive selinux types.
+    // Older bpfloader will simply ignore that, and use the less restrictive default.
+    // This does mean you CANNOT later add a *less* restrictive type than the default.
+    //
+    // Note: we cannot just abort() here as this might be a mainline module shipped optional update
+    return domain::unspecified;
+}
+
+constexpr const char* lookupPinSubdir(const domain d, const char* const unspecified = "") {
+    switch (d) {
+        case domain::unspecified:   return unspecified;
+        case domain::platform:      return "/";
+        case domain::tethering:     return "tethering/";
+        case domain::net_private:   return "net_private/";
+        case domain::net_shared:    return "net_shared/";
+        case domain::netd_readonly: return "netd_readonly/";
+        case domain::netd_shared:   return "netd_shared/";
+        case domain::vendor:        return "vendor/";
+        default:                    return "(unrecognized)";
+    }
+};
+
+domain getDomainFromPinSubdir(const char s[BPF_PIN_SUBDIR_CHAR_ARRAY_SIZE]) {
+    for (domain d : AllDomains) {
+        // Not sure how to enforce this at compile time, so abort() bpfloader at boot instead
+        if (strlen(lookupPinSubdir(d)) >= BPF_PIN_SUBDIR_CHAR_ARRAY_SIZE) abort();
+        if (!strncmp(s, lookupPinSubdir(d), BPF_PIN_SUBDIR_CHAR_ARRAY_SIZE)) return d;
+    }
+    ALOGE("unrecognized pin_subdir '%32s'", s);
+    // pin_subdir affects the object's full pathname,
+    // and thus using the default would change the location and thus our code's ability to find it,
+    // hence this seems worth treating as a true error condition.
+    //
+    // Note: we cannot just abort() here as this might be a mainline module shipped optional update
+    // However, our callers will treat this as an error, and stop loading the specific .o,
+    // which will fail bpfloader if the .o is marked critical.
+    return domain::unrecognized;
+}
 
 static string pathToFilename(const string& path, bool noext = false) {
     vector<string> spath = android::base::Split(path, "/");
@@ -576,8 +638,8 @@ static std::optional<unique_fd> getMapBtfInfo(const char* elfPath,
     return btfFd;
 }
 
-static bool mapMatchesExpectations(unique_fd& fd, string& mapName, struct bpf_map_def& mapDef,
-                                   enum bpf_map_type type) {
+static bool mapMatchesExpectations(const unique_fd& fd, const string& mapName,
+                                   const struct bpf_map_def& mapDef, const enum bpf_map_type type) {
     // bpfGetFd... family of functions require at minimum a 4.14 kernel,
     // so on 4.9 kernels just pretend the map matches our expectations.
     // This isn't really a problem as we only really support 4.14+ anyway...
@@ -587,13 +649,10 @@ static bool mapMatchesExpectations(unique_fd& fd, string& mapName, struct bpf_ma
     // or a newly introduced kernel feature/bug (which is unlikely to get backported to 4.9).
     if (!isAtLeastKernelVersion(4, 14, 0)) return true;
 
-    // These asserts should *never* trigger, if one of them somehow does,
-    // it probably means a bpf .o file has been changed/replaced at runtime
-    // and bpfloader was manually rerun (normally it should only run *once*
-    // early during the boot process).
-    // Another possibility is that something is misconfigured in the code:
-    // most likely a shared map is declared twice differently.
-    // But such a change should never be checked into the source tree...
+    // Assuming fd is a valid Bpf Map file descriptor then
+    // all the following should always succeed on a 4.14+ kernel.
+    // If they somehow do fail, they'll return -1 (and set errno),
+    // which should then cause (among others) a key_size mismatch.
     int fd_type = bpfGetFdMapType(fd);
     int fd_key_size = bpfGetFdKeySize(fd);
     int fd_value_size = bpfGetFdValueSize(fd);
@@ -606,14 +665,20 @@ static bool mapMatchesExpectations(unique_fd& fd, string& mapName, struct bpf_ma
     if (type == BPF_MAP_TYPE_DEVMAP || type == BPF_MAP_TYPE_DEVMAP_HASH)
         desired_map_flags |= BPF_F_RDONLY_PROG;
 
-    // If anything doesn't match, just close the fd - it's of no use anyway.
-    if (fd_type != type) fd.reset();
-    if (fd_key_size != (int)mapDef.key_size) fd.reset();
-    if (fd_value_size != (int)mapDef.value_size) fd.reset();
-    if (fd_max_entries != (int)mapDef.max_entries) fd.reset();
-    if (fd_map_flags != desired_map_flags) fd.reset();
-
-    if (fd.ok()) return true;
+    // The following checks should *never* trigger, if one of them somehow does,
+    // it probably means a bpf .o file has been changed/replaced at runtime
+    // and bpfloader was manually rerun (normally it should only run *once*
+    // early during the boot process).
+    // Another possibility is that something is misconfigured in the code:
+    // most likely a shared map is declared twice differently.
+    // But such a change should never be checked into the source tree...
+    if ((fd_type == type) &&
+        (fd_key_size == (int)mapDef.key_size) &&
+        (fd_value_size == (int)mapDef.value_size) &&
+        (fd_max_entries == (int)mapDef.max_entries) &&
+        (fd_map_flags == desired_map_flags)) {
+        return true;
+    }
 
     ALOGE("bpf map name %s mismatch: desired/found: "
           "type:%d/%d key:%u/%d value:%u/%d entries:%u/%d flags:%u/%d",
@@ -623,7 +688,8 @@ static bool mapMatchesExpectations(unique_fd& fd, string& mapName, struct bpf_ma
 }
 
 static int createMaps(const char* elfPath, ifstream& elfFile, vector<unique_fd>& mapFds,
-                      const char* prefix, size_t sizeOfBpfMapDef) {
+                      const char* prefix, const unsigned long long allowedDomainBitmask,
+                      const size_t sizeOfBpfMapDef) {
     int ret;
     vector<char> mdData, btfData;
     vector<struct bpf_map_def> md;
@@ -661,12 +727,15 @@ static int createMaps(const char* elfPath, ifstream& elfFile, vector<unique_fd>&
     ret = getSectionSymNames(elfFile, "maps", mapNames);
     if (ret) return ret;
 
+    unsigned btfMinBpfLoaderVer = readSectionUint("btf_min_bpfloader_ver", elfFile, 0);
+    unsigned btfMinKernelVer = readSectionUint("btf_min_kernel_ver", elfFile, 0);
+    unsigned kvers = kernelVersion();
+
     std::optional<unique_fd> btfFd;
-    if (!readSectionByName(".BTF", elfFile, btfData)) {
+    if ((BPFLOADER_VERSION >= btfMinBpfLoaderVer) && (kvers >= btfMinKernelVer) &&
+        (!readSectionByName(".BTF", elfFile, btfData))) {
         btfFd = getMapBtfInfo(elfPath, btfTypeIdMap);
     }
-
-    unsigned kvers = kernelVersion();
 
     for (int i = 0; i < (int)mapNames.size(); i++) {
         if (BPFLOADER_VERSION < md[i].bpfloader_min_ver) {
@@ -719,9 +788,35 @@ static int createMaps(const char* elfPath, ifstream& elfFile, vector<unique_fd>&
             type = BPF_MAP_TYPE_HASH;
         }
 
-        // Format of pin location is /sys/fs/bpf/<prefix>map_<filename>_<mapname>
-        string mapPinLoc =
-                string(BPF_FS_PATH) + prefix + "map_" + fname + "_" + string(mapNames[i]);
+        domain selinux_context = getDomainFromSelinuxContext(md[i].selinux_context);
+        if (specified(selinux_context)) {
+            if (!inDomainBitmask(selinux_context, allowedDomainBitmask)) {
+                ALOGE("map %s has invalid selinux_context of %d (allowed bitmask 0x%llx)",
+                      mapNames[i].c_str(), selinux_context, allowedDomainBitmask);
+                return -EINVAL;
+            }
+            ALOGI("map %s selinux_context [%32s] -> %d -> '%s' (%s)", mapNames[i].c_str(),
+                  md[i].selinux_context, selinux_context, lookupSelinuxContext(selinux_context),
+                  lookupPinSubdir(selinux_context));
+        }
+
+        domain pin_subdir = getDomainFromPinSubdir(md[i].pin_subdir);
+        if (unrecognized(pin_subdir)) return -ENOTDIR;
+        if (specified(pin_subdir)) {
+            if (!inDomainBitmask(pin_subdir, allowedDomainBitmask)) {
+                ALOGE("map %s has invalid pin_subdir of %d (allowed bitmask 0x%llx)",
+                      mapNames[i].c_str(), pin_subdir, allowedDomainBitmask);
+                return -EINVAL;
+            }
+            ALOGI("map %s pin_subdir [%32s] -> %d -> '%s'", mapNames[i].c_str(), md[i].pin_subdir,
+                  pin_subdir, lookupPinSubdir(pin_subdir));
+        }
+
+        // Format of pin location is /sys/fs/bpf/<pin_subdir|prefix>map_<filename>_<mapname>
+        // except that maps shared across .o's have empty <filename>
+        // Note: <filename> refers to the extension-less basename of the .o file.
+        string mapPinLoc = string(BPF_FS_PATH) + lookupPinSubdir(pin_subdir, prefix) + "map_" +
+                           (md[i].shared ? "" : fname) + "_" + mapNames[i];
         bool reuse = false;
         unique_fd fd;
         int saved_errno;
@@ -758,12 +853,40 @@ static int createMaps(const char* elfPath, ifstream& elfFile, vector<unique_fd>&
         if (!mapMatchesExpectations(fd, mapNames[i], md[i], type)) return -ENOTUNIQ;
 
         if (!reuse) {
-            ret = bpf_obj_pin(fd, mapPinLoc.c_str());
-            if (ret) return -errno;
+            if (specified(selinux_context)) {
+                string createLoc = string(BPF_FS_PATH) + lookupPinSubdir(selinux_context) +
+                                   "tmp_map_" + fname + "_" + mapNames[i];
+                ret = bpf_obj_pin(fd, createLoc.c_str());
+                if (ret) {
+                    int err = errno;
+                    ALOGE("create %s -> %d [%d:%s]", createLoc.c_str(), ret, err, strerror(err));
+                    return -err;
+                }
+                ret = rename(createLoc.c_str(), mapPinLoc.c_str());
+                if (ret) {
+                    int err = errno;
+                    ALOGE("rename %s %s -> %d [%d:%s]", createLoc.c_str(), mapPinLoc.c_str(), ret,
+                          err, strerror(err));
+                    return -err;
+                }
+            } else {
+                ret = bpf_obj_pin(fd, mapPinLoc.c_str());
+                if (ret) return -errno;
+            }
             ret = chown(mapPinLoc.c_str(), (uid_t)md[i].uid, (gid_t)md[i].gid);
-            if (ret) return -errno;
+            if (ret) {
+                int err = errno;
+                ALOGE("chown(%s, %u, %u) = %d [%d:%s]", mapPinLoc.c_str(), md[i].uid, md[i].gid,
+                      ret, err, strerror(err));
+                return -err;
+            }
             ret = chmod(mapPinLoc.c_str(), md[i].mode);
-            if (ret) return -errno;
+            if (ret) {
+                int err = errno;
+                ALOGE("chmod(%s, 0%o) = %d [%d:%s]", mapPinLoc.c_str(), md[i].mode, ret, err,
+                      strerror(err));
+                return -err;
+            }
         }
 
         struct bpf_map_info map_info = {};
@@ -855,7 +978,7 @@ static void applyMapRelo(ifstream& elfFile, vector<unique_fd> &mapFds, vector<co
 }
 
 static int loadCodeSections(const char* elfPath, vector<codeSection>& cs, const string& license,
-                            const char* prefix) {
+                            const char* prefix, const unsigned long long allowedDomainBitmask) {
     unsigned kvers = kernelVersion();
     int ret, fd;
 
@@ -867,6 +990,8 @@ static int loadCodeSections(const char* elfPath, vector<codeSection>& cs, const 
         string name = cs[i].name;
         unsigned bpfMinVer = DEFAULT_BPFLOADER_MIN_VER;  // v0.0
         unsigned bpfMaxVer = DEFAULT_BPFLOADER_MAX_VER;  // v1.0
+        domain selinux_context = domain::unspecified;
+        domain pin_subdir = domain::unspecified;
 
         if (cs[i].prog_def.has_value()) {
             unsigned min_kver = cs[i].prog_def->min_kver;
@@ -878,12 +1003,38 @@ static int loadCodeSections(const char* elfPath, vector<codeSection>& cs, const 
 
             bpfMinVer = cs[i].prog_def->bpfloader_min_ver;
             bpfMaxVer = cs[i].prog_def->bpfloader_max_ver;
+            selinux_context = getDomainFromSelinuxContext(cs[i].prog_def->selinux_context);
+            pin_subdir = getDomainFromPinSubdir(cs[i].prog_def->pin_subdir);
+            // Note: make sure to only check for unrecognized *after* verifying bpfloader
+            // version limits include this bpfloader's version.
         }
 
         ALOGD("cs[%d].name:%s requires bpfloader version [0x%05x,0x%05x)", i, name.c_str(),
               bpfMinVer, bpfMaxVer);
         if (BPFLOADER_VERSION < bpfMinVer) continue;
         if (BPFLOADER_VERSION >= bpfMaxVer) continue;
+        if (unrecognized(pin_subdir)) return -ENOTDIR;
+
+        if (specified(selinux_context)) {
+            if (!inDomainBitmask(selinux_context, allowedDomainBitmask)) {
+                ALOGE("prog %s has invalid selinux_context of %d (allowed bitmask 0x%llx)",
+                      name.c_str(), selinux_context, allowedDomainBitmask);
+                return -EINVAL;
+            }
+            ALOGI("prog %s selinux_context [%32s] -> %d -> '%s' (%s)", name.c_str(),
+                  cs[i].prog_def->selinux_context, selinux_context,
+                  lookupSelinuxContext(selinux_context), lookupPinSubdir(selinux_context));
+        }
+
+        if (specified(pin_subdir)) {
+            if (!inDomainBitmask(pin_subdir, allowedDomainBitmask)) {
+                ALOGE("prog %s has invalid pin_subdir of %d (allowed bitmask 0x%llx)", name.c_str(),
+                      pin_subdir, allowedDomainBitmask);
+                return -EINVAL;
+            }
+            ALOGI("prog %s pin_subdir [%32s] -> %d -> '%s'", name.c_str(),
+                  cs[i].prog_def->pin_subdir, pin_subdir, lookupPinSubdir(pin_subdir));
+        }
 
         // strip any potential $foo suffix
         // this can be used to provide duplicate programs
@@ -893,12 +1044,8 @@ static int loadCodeSections(const char* elfPath, vector<codeSection>& cs, const 
         bool reuse = false;
         // Format of pin location is
         // /sys/fs/bpf/<prefix>prog_<filename>_<mapname>
-        string progPinLoc = BPF_FS_PATH;
-        progPinLoc += prefix;
-        progPinLoc += "prog_";
-        progPinLoc += fname;
-        progPinLoc += '_';
-        progPinLoc += name;
+        string progPinLoc = string(BPF_FS_PATH) + lookupPinSubdir(pin_subdir, prefix) + "prog_" +
+                            fname + '_' + string(name);
         if (access(progPinLoc.c_str(), F_OK) == 0) {
             fd = retrieveProgram(progPinLoc.c_str());
             ALOGD("New bpf prog load reusing prog %s, ret: %d (%s)", progPinLoc.c_str(), fd,
@@ -941,13 +1088,42 @@ static int loadCodeSections(const char* elfPath, vector<codeSection>& cs, const 
         if (fd == 0) return -EINVAL;
 
         if (!reuse) {
-            ret = bpf_obj_pin(fd, progPinLoc.c_str());
-            if (ret) return -errno;
-            if (chmod(progPinLoc.c_str(), 0440)) return -errno;
+            if (specified(selinux_context)) {
+                string createLoc = string(BPF_FS_PATH) + lookupPinSubdir(selinux_context) +
+                                   "tmp_prog_" + fname + '_' + string(name);
+                ret = bpf_obj_pin(fd, createLoc.c_str());
+                if (ret) {
+                    int err = errno;
+                    ALOGE("create %s -> %d [%d:%s]", createLoc.c_str(), ret, err, strerror(err));
+                    return -err;
+                }
+                ret = rename(createLoc.c_str(), progPinLoc.c_str());
+                if (ret) {
+                    int err = errno;
+                    ALOGE("rename %s %s -> %d [%d:%s]", createLoc.c_str(), progPinLoc.c_str(), ret,
+                          err, strerror(err));
+                    return -err;
+                }
+            } else {
+                ret = bpf_obj_pin(fd, progPinLoc.c_str());
+                if (ret) {
+                    int err = errno;
+                    ALOGE("create %s -> %d [%d:%s]", progPinLoc.c_str(), ret, err, strerror(err));
+                    return -err;
+                }
+            }
+            if (chmod(progPinLoc.c_str(), 0440)) {
+                int err = errno;
+                ALOGE("chmod %s 0440 -> [%d:%s]", progPinLoc.c_str(), err, strerror(err));
+                return -err;
+            }
             if (cs[i].prog_def.has_value()) {
                 if (chown(progPinLoc.c_str(), (uid_t)cs[i].prog_def->uid,
                           (gid_t)cs[i].prog_def->gid)) {
-                    return -errno;
+                    int err = errno;
+                    ALOGE("chown %s %d %d -> [%d:%s]", progPinLoc.c_str(), cs[i].prog_def->uid,
+                          cs[i].prog_def->gid, err, strerror(err));
+                    return -err;
                 }
             }
         }
@@ -968,7 +1144,8 @@ static int loadCodeSections(const char* elfPath, vector<codeSection>& cs, const 
 }
 
 int loadProg(const char* elfPath, bool* isCritical, const char* prefix,
-             const bpf_prog_type* allowed, size_t numAllowed) {
+             const unsigned long long allowedDomainBitmask, const bpf_prog_type* allowed,
+             size_t numAllowed) {
     vector<char> license;
     vector<char> critical;
     vector<codeSection> cs;
@@ -1042,7 +1219,7 @@ int loadProg(const char* elfPath, bool* isCritical, const char* prefix,
     /* Just for future debugging */
     if (0) dumpAllCs(cs);
 
-    ret = createMaps(elfPath, elfFile, mapFds, prefix, sizeOfBpfMapDef);
+    ret = createMaps(elfPath, elfFile, mapFds, prefix, allowedDomainBitmask, sizeOfBpfMapDef);
     if (ret) {
         ALOGE("Failed to create maps: (ret=%d) in %s", ret, elfPath);
         return ret;
@@ -1053,7 +1230,7 @@ int loadProg(const char* elfPath, bool* isCritical, const char* prefix,
 
     applyMapRelo(elfFile, mapFds, cs);
 
-    ret = loadCodeSections(elfPath, cs, string(license.data()), prefix);
+    ret = loadCodeSections(elfPath, cs, string(license.data()), prefix, allowedDomainBitmask);
     if (ret) ALOGE("Failed to load programs, loadCodeSections ret=%d", ret);
 
     return ret;

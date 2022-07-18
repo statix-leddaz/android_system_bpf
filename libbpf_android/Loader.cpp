@@ -30,9 +30,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-// This is BpfLoader v0.19
+// This is BpfLoader v0.26
 #define BPFLOADER_VERSION_MAJOR 0u
-#define BPFLOADER_VERSION_MINOR 19u
+#define BPFLOADER_VERSION_MINOR 26u
 #define BPFLOADER_VERSION ((BPFLOADER_VERSION_MAJOR << 16) | BPFLOADER_VERSION_MINOR)
 
 #include "bpf/BpfUtils.h"
@@ -93,7 +93,7 @@ domain getDomainFromSelinuxContext(const char s[BPF_SELINUX_CONTEXT_CHAR_ARRAY_S
         if (strlen(lookupSelinuxContext(d)) >= BPF_SELINUX_CONTEXT_CHAR_ARRAY_SIZE) abort();
         if (!strncmp(s, lookupSelinuxContext(d), BPF_SELINUX_CONTEXT_CHAR_ARRAY_SIZE)) return d;
     }
-    ALOGW("ignoring unrecognized selinux_context '%32s'", s);
+    ALOGW("ignoring unrecognized selinux_context '%-32s'", s);
     // We should return 'unrecognized' here, however: returning unspecified will
     // result in the system simply using the default context, which in turn
     // will allow future expansion by adding more restrictive selinux types.
@@ -124,7 +124,7 @@ domain getDomainFromPinSubdir(const char s[BPF_PIN_SUBDIR_CHAR_ARRAY_SIZE]) {
         if (strlen(lookupPinSubdir(d)) >= BPF_PIN_SUBDIR_CHAR_ARRAY_SIZE) abort();
         if (!strncmp(s, lookupPinSubdir(d), BPF_PIN_SUBDIR_CHAR_ARRAY_SIZE)) return d;
     }
-    ALOGE("unrecognized pin_subdir '%32s'", s);
+    ALOGE("unrecognized pin_subdir '%-32s'", s);
     // pin_subdir affects the object's full pathname,
     // and thus using the default would change the location and thus our code's ability to find it,
     // hence this seems worth treating as a true error condition.
@@ -135,15 +135,14 @@ domain getDomainFromPinSubdir(const char s[BPF_PIN_SUBDIR_CHAR_ARRAY_SIZE]) {
     return domain::unrecognized;
 }
 
-static string pathToFilename(const string& path, bool noext = false) {
-    vector<string> spath = android::base::Split(path, "/");
-    string ret = spath.back();
-
-    if (noext) {
-        size_t lastindex = ret.find_last_of('.');
-        return ret.substr(0, lastindex);
-    }
-    return ret;
+static string pathToObjName(const string& path) {
+    // extract everything after the final slash, ie. this is the filename 'foo@1.o' or 'bar.o'
+    string filename = android::base::Split(path, "/").back();
+    // strip off everything from the final period onwards (strip '.o' suffix), ie. 'foo@1' or 'bar'
+    string name = filename.substr(0, filename.find_last_of('.'));
+    // strip any potential @1 suffix, this will leave us with just 'foo' or 'bar'
+    // this can be used to provide duplicate programs (mux based on the bpfloader version)
+    return name.substr(0, name.find_last_of('@'));
 }
 
 typedef struct {
@@ -695,7 +694,7 @@ static int createMaps(const char* elfPath, ifstream& elfFile, vector<unique_fd>&
     vector<struct bpf_map_def> md;
     vector<string> mapNames;
     std::unordered_map<string, std::pair<uint32_t, uint32_t>> btfTypeIdMap;
-    string fname = pathToFilename(string(elfPath), true);
+    string objName = pathToObjName(string(elfPath));
 
     ret = readSectionByName("maps", elfFile, mdData);
     if (ret == -2) return 0;  // no maps to read
@@ -795,7 +794,7 @@ static int createMaps(const char* elfPath, ifstream& elfFile, vector<unique_fd>&
                       mapNames[i].c_str(), selinux_context, allowedDomainBitmask);
                 return -EINVAL;
             }
-            ALOGI("map %s selinux_context [%32s] -> %d -> '%s' (%s)", mapNames[i].c_str(),
+            ALOGI("map %s selinux_context [%-32s] -> %d -> '%s' (%s)", mapNames[i].c_str(),
                   md[i].selinux_context, selinux_context, lookupSelinuxContext(selinux_context),
                   lookupPinSubdir(selinux_context));
         }
@@ -808,21 +807,21 @@ static int createMaps(const char* elfPath, ifstream& elfFile, vector<unique_fd>&
                       mapNames[i].c_str(), pin_subdir, allowedDomainBitmask);
                 return -EINVAL;
             }
-            ALOGI("map %s pin_subdir [%32s] -> %d -> '%s'", mapNames[i].c_str(), md[i].pin_subdir,
+            ALOGI("map %s pin_subdir [%-32s] -> %d -> '%s'", mapNames[i].c_str(), md[i].pin_subdir,
                   pin_subdir, lookupPinSubdir(pin_subdir));
         }
 
-        // Format of pin location is /sys/fs/bpf/<pin_subdir|prefix>map_<filename>_<mapname>
-        // except that maps shared across .o's have empty <filename>
-        // Note: <filename> refers to the extension-less basename of the .o file.
+        // Format of pin location is /sys/fs/bpf/<pin_subdir|prefix>map_<objName>_<mapName>
+        // except that maps shared across .o's have empty <objName>
+        // Note: <objName> refers to the extension-less basename of the .o file (without @ suffix).
         string mapPinLoc = string(BPF_FS_PATH) + lookupPinSubdir(pin_subdir, prefix) + "map_" +
-                           (md[i].shared ? "" : fname) + "_" + mapNames[i];
+                           (md[i].shared ? "" : objName) + "_" + mapNames[i];
         bool reuse = false;
         unique_fd fd;
         int saved_errno;
 
         if (access(mapPinLoc.c_str(), F_OK) == 0) {
-            fd.reset(bpf_obj_get(mapPinLoc.c_str()));
+            fd.reset(mapRetrieveRO(mapPinLoc.c_str()));
             saved_errno = errno;
             ALOGD("bpf_create_map reusing map %s, ret: %d", mapNames[i].c_str(), fd.get());
             reuse = true;
@@ -855,7 +854,7 @@ static int createMaps(const char* elfPath, ifstream& elfFile, vector<unique_fd>&
         if (!reuse) {
             if (specified(selinux_context)) {
                 string createLoc = string(BPF_FS_PATH) + lookupPinSubdir(selinux_context) +
-                                   "tmp_map_" + fname + "_" + mapNames[i];
+                                   "tmp_map_" + objName + "_" + mapNames[i];
                 ret = bpf_obj_pin(fd, createLoc.c_str());
                 if (ret) {
                     int err = errno;
@@ -871,20 +870,24 @@ static int createMaps(const char* elfPath, ifstream& elfFile, vector<unique_fd>&
                 }
             } else {
                 ret = bpf_obj_pin(fd, mapPinLoc.c_str());
-                if (ret) return -errno;
-            }
-            ret = chown(mapPinLoc.c_str(), (uid_t)md[i].uid, (gid_t)md[i].gid);
-            if (ret) {
-                int err = errno;
-                ALOGE("chown(%s, %u, %u) = %d [%d:%s]", mapPinLoc.c_str(), md[i].uid, md[i].gid,
-                      ret, err, strerror(err));
-                return -err;
+                if (ret) {
+                    int err = errno;
+                    ALOGE("pin %s -> %d [%d:%s]", mapPinLoc.c_str(), ret, err, strerror(err));
+                    return -err;
+                }
             }
             ret = chmod(mapPinLoc.c_str(), md[i].mode);
             if (ret) {
                 int err = errno;
                 ALOGE("chmod(%s, 0%o) = %d [%d:%s]", mapPinLoc.c_str(), md[i].mode, ret, err,
                       strerror(err));
+                return -err;
+            }
+            ret = chown(mapPinLoc.c_str(), (uid_t)md[i].uid, (gid_t)md[i].gid);
+            if (ret) {
+                int err = errno;
+                ALOGE("chown(%s, %u, %u) = %d [%d:%s]", mapPinLoc.c_str(), md[i].uid, md[i].gid,
+                      ret, err, strerror(err));
                 return -err;
             }
         }
@@ -933,10 +936,9 @@ static void applyRelo(void* insnsPtr, Elf64_Addr offset, int fd) {
     insnIndex = offset / sizeof(struct bpf_insn);
     insn = &insns[insnIndex];
 
-    ALOGD(
-        "applying relo to instruction at byte offset: %d, \
-	       insn offset %d , insn %lx\n",
-        (int)offset, (int)insnIndex, *(unsigned long*)insn);
+    ALOGD("applying relo to instruction at byte offset: %llu, "
+          "insn offset %d, insn %llx",
+          (unsigned long long)offset, insnIndex, *(unsigned long long*)insn);
 
     if (insn->code != (BPF_LD | BPF_IMM | BPF_DW)) {
         ALOGE("Dumping all instructions till ins %d", insnIndex);
@@ -984,7 +986,7 @@ static int loadCodeSections(const char* elfPath, vector<codeSection>& cs, const 
 
     if (!kvers) return -1;
 
-    string fname = pathToFilename(string(elfPath), true);
+    string objName = pathToObjName(string(elfPath));
 
     for (int i = 0; i < (int)cs.size(); i++) {
         string name = cs[i].name;
@@ -1021,7 +1023,7 @@ static int loadCodeSections(const char* elfPath, vector<codeSection>& cs, const 
                       name.c_str(), selinux_context, allowedDomainBitmask);
                 return -EINVAL;
             }
-            ALOGI("prog %s selinux_context [%32s] -> %d -> '%s' (%s)", name.c_str(),
+            ALOGI("prog %s selinux_context [%-32s] -> %d -> '%s' (%s)", name.c_str(),
                   cs[i].prog_def->selinux_context, selinux_context,
                   lookupSelinuxContext(selinux_context), lookupPinSubdir(selinux_context));
         }
@@ -1032,7 +1034,7 @@ static int loadCodeSections(const char* elfPath, vector<codeSection>& cs, const 
                       pin_subdir, allowedDomainBitmask);
                 return -EINVAL;
             }
-            ALOGI("prog %s pin_subdir [%32s] -> %d -> '%s'", name.c_str(),
+            ALOGI("prog %s pin_subdir [%-32s] -> %d -> '%s'", name.c_str(),
                   cs[i].prog_def->pin_subdir, pin_subdir, lookupPinSubdir(pin_subdir));
         }
 
@@ -1043,9 +1045,9 @@ static int loadCodeSections(const char* elfPath, vector<codeSection>& cs, const 
 
         bool reuse = false;
         // Format of pin location is
-        // /sys/fs/bpf/<prefix>prog_<filename>_<mapname>
+        // /sys/fs/bpf/<prefix>prog_<objName>_<progName>
         string progPinLoc = string(BPF_FS_PATH) + lookupPinSubdir(pin_subdir, prefix) + "prog_" +
-                            fname + '_' + string(name);
+                            objName + '_' + string(name);
         if (access(progPinLoc.c_str(), F_OK) == 0) {
             fd = retrieveProgram(progPinLoc.c_str());
             ALOGD("New bpf prog load reusing prog %s, ret: %d (%s)", progPinLoc.c_str(), fd,
@@ -1076,7 +1078,7 @@ static int loadCodeSections(const char* elfPath, vector<codeSection>& cs, const 
                 for (const auto& line : lines) ALOGW("%s", line.c_str());
                 ALOGW("bpf_prog_load - END log_buf contents.");
 
-                if (cs[i].prog_def->optional) {
+                if (cs[i].prog_def.has_value() && cs[i].prog_def->optional) {
                     ALOGW("failed program is marked optional - continuing...");
                     continue;
                 }
@@ -1090,7 +1092,7 @@ static int loadCodeSections(const char* elfPath, vector<codeSection>& cs, const 
         if (!reuse) {
             if (specified(selinux_context)) {
                 string createLoc = string(BPF_FS_PATH) + lookupPinSubdir(selinux_context) +
-                                   "tmp_prog_" + fname + '_' + string(name);
+                                   "tmp_prog_" + objName + '_' + string(name);
                 ret = bpf_obj_pin(fd, createLoc.c_str());
                 if (ret) {
                     int err = errno;
@@ -1176,6 +1178,8 @@ int loadProg(const char* elfPath, bool* isCritical, const char* prefix,
             readSectionUint("bpfloader_min_ver", elfFile, DEFAULT_BPFLOADER_MIN_VER);
     unsigned int bpfLoaderMaxVer =
             readSectionUint("bpfloader_max_ver", elfFile, DEFAULT_BPFLOADER_MAX_VER);
+    unsigned int bpfLoaderMinRequiredVer =
+            readSectionUint("bpfloader_min_required_ver", elfFile, 0);
     size_t sizeOfBpfMapDef =
             readSectionUint("size_of_bpf_map_def", elfFile, DEFAULT_SIZEOF_BPF_MAP_DEF);
     size_t sizeOfBpfProgDef =
@@ -1193,6 +1197,12 @@ int loadProg(const char* elfPath, bool* isCritical, const char* prefix,
         ALOGI("BpfLoader version 0x%05x ignoring ELF object %s with max ver 0x%05x",
               BPFLOADER_VERSION, elfPath, bpfLoaderMaxVer);
         return 0;
+    }
+
+    if (BPFLOADER_VERSION < bpfLoaderMinRequiredVer) {
+        ALOGI("BpfLoader version 0x%05x failing due to ELF object %s with required min ver 0x%05x",
+              BPFLOADER_VERSION, elfPath, bpfLoaderMinRequiredVer);
+        return -1;
     }
 
     ALOGI("BpfLoader version 0x%05x processing ELF object %s with ver [0x%05x,0x%05x)",

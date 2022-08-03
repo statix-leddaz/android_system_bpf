@@ -107,6 +107,7 @@ constexpr bpf_prog_type kPlatformAllowedProgTypes[] = {
         BPF_PROG_TYPE_PERF_EVENT,
         BPF_PROG_TYPE_SOCKET_FILTER,
         BPF_PROG_TYPE_TRACEPOINT,
+        BPF_PROG_TYPE_UNSPEC,  // Will be replaced with fuse bpf program type
 };
 
 // see b/162057235. For arbitrary program types, the concern is that due to the lack of
@@ -272,6 +273,15 @@ int main(int argc, char** argv) {
             sleep(20);
             return 2;
         }
+    }
+
+    int key = 1;
+    int value = 123;
+    android::base::unique_fd map(
+            android::bpf::createMap(BPF_MAP_TYPE_ARRAY, sizeof(key), sizeof(value), 2, 0));
+    if (android::bpf::writeToMapEntry(map, &key, &value, BPF_ANY)) {
+        ALOGE("Critical kernel bug - failure to write into index 1 of 2 element bpf map array.");
+        return 1;
     }
 
     if (android::base::SetProperty("bpf.progs_loaded", "1") == false) {

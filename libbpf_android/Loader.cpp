@@ -30,14 +30,18 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-// This is BpfLoader v0.27
+// This is BpfLoader v0.28
 #define BPFLOADER_VERSION_MAJOR 0u
-#define BPFLOADER_VERSION_MINOR 27u
+#define BPFLOADER_VERSION_MINOR 28u
 #define BPFLOADER_VERSION ((BPFLOADER_VERSION_MAJOR << 16) | BPFLOADER_VERSION_MINOR)
 
 #include "bpf/BpfUtils.h"
 #include "bpf/bpf_map_def.h"
 #include "include/libbpf_android.h"
+
+#if BPFLOADER_VERSION < COMPILE_FOR_BPFLOADER_VERSION
+#error "BPFLOADER_VERSION is less than COMPILE_FOR_BPFLOADER_VERSION"
+#endif
 
 #include <bpf/bpf.h>
 
@@ -354,16 +358,18 @@ static int readSymTab(ifstream& elfFile, int sort, vector<Elf64_Sym>& data) {
     return 0;
 }
 
+static enum bpf_prog_type getFuseProgType() {
+    int result = BPF_PROG_TYPE_UNSPEC;
+    ifstream("/sys/fs/fuse/bpf_prog_type_fuse") >> result;
+    return static_cast<bpf_prog_type>(result);
+}
+
 static enum bpf_prog_type getSectionType(string& name) {
     for (auto& snt : sectionNameTypes)
         if (StartsWith(name, snt.name)) return snt.type;
 
     // TODO Remove this code when fuse-bpf is upstream and this BPF_PROG_TYPE_FUSE is fixed
-    if (StartsWith(name, "fuse/")) {
-        int result = BPF_PROG_TYPE_UNSPEC;
-        ifstream("/sys/fs/fuse/bpf_prog_type_fuse") >> result;
-        return static_cast<bpf_prog_type>(result);
-    }
+    if (StartsWith(name, "fuse/")) return getFuseProgType();
 
     return BPF_PROG_TYPE_UNSPEC;
 }
@@ -465,7 +471,10 @@ static bool IsAllowed(bpf_prog_type type, const bpf_prog_type* allowed, size_t n
     if (allowed == nullptr) return true;
 
     for (size_t i = 0; i < numAllowed; i++) {
-        if (type == allowed[i]) return true;
+        if (allowed[i] == BPF_PROG_TYPE_UNSPEC) {
+            if (type == getFuseProgType()) return true;
+        } else if (type == allowed[i])
+            return true;
     }
 
     return false;
@@ -737,6 +746,8 @@ static int createMaps(const char* elfPath, ifstream& elfFile, vector<unique_fd>&
     }
 
     for (int i = 0; i < (int)mapNames.size(); i++) {
+        if (md[i].zero != 0) abort();
+
         if (BPFLOADER_VERSION < md[i].bpfloader_min_ver) {
             ALOGI("skipping map %s which requires bpfloader min ver 0x%05x", mapNames[i].c_str(),
                   md[i].bpfloader_min_ver);

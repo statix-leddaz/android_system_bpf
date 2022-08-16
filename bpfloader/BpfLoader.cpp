@@ -54,12 +54,61 @@ using android::base::EndsWith;
 using android::bpf::domain;
 using std::string;
 
+bool exists(const char* const path) {
+    int v = access(path, F_OK);
+    if (!v) {
+        ALOGI("%s exists.", path);
+        return true;
+    }
+    if (errno == ENOENT) return false;
+    ALOGE("FATAL: access(%s, F_OK) -> %d [%d:%s]", path, v, errno, strerror(errno));
+    abort();  // can only hit this if permissions (likely selinux) are screwed up
+}
+
+bool isInProcessTethering() {
+    bool in = exists("/apex/com.android.tethering/etc/flag/in-process");
+    bool out = exists("/apex/com.android.tethering/etc/flag/out-of-process");
+    if (in && out) abort();  // bad build
+
+    // Handle cases where the module explicitly tells us
+    if (in) return true;
+    if (out) return false;
+
+    ALOGE("FATAL: cannot determine if Tethering is in or out of process.");
+    abort();
+}
+
 constexpr unsigned long long kTetheringApexDomainBitmask =
         domainToBitmask(domain::tethering) |
         domainToBitmask(domain::net_private) |
         domainToBitmask(domain::net_shared) |
         domainToBitmask(domain::netd_readonly) |
         domainToBitmask(domain::netd_shared);
+
+// Programs shipped inside the tethering apex should be limited to networking stuff,
+// as KPROBE, PERF_EVENT, TRACEPOINT are dangerous to use from mainline updatable code,
+// since they are less stable abi/api and may conflict with platform uses of bpf.
+constexpr bpf_prog_type kTetheringApexAllowedProgTypes[] = {
+        BPF_PROG_TYPE_CGROUP_SOCK_ADDR,
+        BPF_PROG_TYPE_CGROUP_SKB,
+        BPF_PROG_TYPE_CGROUP_SOCK,
+        BPF_PROG_TYPE_SCHED_ACT,
+        BPF_PROG_TYPE_SCHED_CLS,
+        BPF_PROG_TYPE_SOCKET_FILTER,
+        BPF_PROG_TYPE_XDP,
+};
+
+// Networking-related program types are limited to the Tethering Apex
+// to prevent things from breaking due to conflicts on mainline updates
+// (exception made for socket filters, ie. xt_bpf for potential use in iptables,
+// or for attaching to sockets directly)
+constexpr bpf_prog_type kPlatformAllowedProgTypes[] = {
+        BPF_PROG_TYPE_KPROBE,
+        BPF_PROG_TYPE_PERF_EVENT,
+        BPF_PROG_TYPE_SOCKET_FILTER,
+        BPF_PROG_TYPE_TRACEPOINT,
+        BPF_PROG_TYPE_UNSPEC,  // Will be replaced with fuse bpf program type
+};
 
 // see b/162057235. For arbitrary program types, the concern is that due to the lack of
 // SELinux access controls over BPF program attachpoints, we have no way to control the
@@ -83,6 +132,8 @@ const Location locations[] = {
                 .dir = "/apex/com.android.tethering/etc/bpf/",
                 .prefix = "tethering/",
                 .allowedDomainBitmask = kTetheringApexDomainBitmask,
+                .allowedProgTypes = kTetheringApexAllowedProgTypes,
+                .allowedProgTypesLength = arraysize(kTetheringApexAllowedProgTypes),
         },
         // T+ Tethering mainline module (shared with netd & system server)
         // netutils_wrapper (for iptables xt_bpf) has access to programs
@@ -90,6 +141,8 @@ const Location locations[] = {
                 .dir = "/apex/com.android.tethering/etc/bpf/netd_shared/",
                 .prefix = "netd_shared/",
                 .allowedDomainBitmask = kTetheringApexDomainBitmask,
+                .allowedProgTypes = kTetheringApexAllowedProgTypes,
+                .allowedProgTypesLength = arraysize(kTetheringApexAllowedProgTypes),
         },
         // T+ Tethering mainline module (shared with netd & system server)
         // netutils_wrapper has no access, netd has read only access
@@ -97,24 +150,32 @@ const Location locations[] = {
                 .dir = "/apex/com.android.tethering/etc/bpf/netd_readonly/",
                 .prefix = "netd_readonly/",
                 .allowedDomainBitmask = kTetheringApexDomainBitmask,
+                .allowedProgTypes = kTetheringApexAllowedProgTypes,
+                .allowedProgTypesLength = arraysize(kTetheringApexAllowedProgTypes),
         },
         // T+ Tethering mainline module (shared with system server)
         {
                 .dir = "/apex/com.android.tethering/etc/bpf/net_shared/",
                 .prefix = "net_shared/",
                 .allowedDomainBitmask = kTetheringApexDomainBitmask,
+                .allowedProgTypes = kTetheringApexAllowedProgTypes,
+                .allowedProgTypesLength = arraysize(kTetheringApexAllowedProgTypes),
         },
         // T+ Tethering mainline module (not shared, just network_stack)
         {
                 .dir = "/apex/com.android.tethering/etc/bpf/net_private/",
                 .prefix = "net_private/",
                 .allowedDomainBitmask = kTetheringApexDomainBitmask,
+                .allowedProgTypes = kTetheringApexAllowedProgTypes,
+                .allowedProgTypesLength = arraysize(kTetheringApexAllowedProgTypes),
         },
         // Core operating system
         {
                 .dir = "/system/etc/bpf/",
                 .prefix = "",
                 .allowedDomainBitmask = domainToBitmask(domain::platform),
+                .allowedProgTypes = kPlatformAllowedProgTypes,
+                .allowedProgTypesLength = arraysize(kPlatformAllowedProgTypes),
         },
         // Vendor operating system
         {
@@ -167,7 +228,7 @@ void createSysFsBpfSubDir(const char* const prefix) {
         errno = 0;
         int ret = mkdir(s.c_str(), S_ISVTX | S_IRWXU | S_IRWXG | S_IRWXO);
         if (ret && errno != EEXIST) {
-            ALOGW("Failed to create directory: %s, ret: %s", s.c_str(), std::strerror(errno));
+            ALOGE("Failed to create directory: %s, ret: %s", s.c_str(), std::strerror(errno));
         }
 
         umask(prevUmask);
@@ -177,6 +238,21 @@ void createSysFsBpfSubDir(const char* const prefix) {
 int main(int argc, char** argv) {
     (void)argc;
     android::base::InitLogging(argv, &android::base::KernelLogger);
+
+    // This is ugly... but this allows InProcessTethering which runs as system_server,
+    // instead of as network_stack to access /sys/fs/bpf/tethering, which would otherwise
+    // (due to genfscon rules) have fs_bpf_tethering selinux context, which is restricted
+    // to the network_stack process only (which is where out of process tethering runs)
+    if (isInProcessTethering() && !exists("/sys/fs/bpf/tethering")) {
+        createSysFsBpfSubDir(/* /sys/fs/bpf/ */ "net_shared");
+        createSysFsBpfSubDir(/* /sys/fs/bpf/ */ "net_shared/tethering");
+
+        /* /sys/fs/bpf/tethering -> net_shared/tethering */
+        if (symlink("net_shared/tethering", "/sys/fs/bpf/tethering")) {
+            ALOGE("symlink(net_shared/tethering, /sys/fs/bpf/tethering) -> %s", strerror(errno));
+            return 1;
+        }
+    }
 
     // Create all the pin subdirectories
     // (this must be done first to allow selinux_context and pin_subdir functionality,
@@ -197,6 +273,15 @@ int main(int argc, char** argv) {
             sleep(20);
             return 2;
         }
+    }
+
+    int key = 1;
+    int value = 123;
+    android::base::unique_fd map(
+            android::bpf::createMap(BPF_MAP_TYPE_ARRAY, sizeof(key), sizeof(value), 2, 0));
+    if (android::bpf::writeToMapEntry(map, &key, &value, BPF_ANY)) {
+        ALOGE("Critical kernel bug - failure to write into index 1 of 2 element bpf map array.");
+        return 1;
     }
 
     if (android::base::SetProperty("bpf.progs_loaded", "1") == false) {

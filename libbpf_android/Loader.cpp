@@ -30,9 +30,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-// This is BpfLoader v0.19
+// This is BpfLoader v0.18
 #define BPFLOADER_VERSION_MAJOR 0u
-#define BPFLOADER_VERSION_MINOR 19u
+#define BPFLOADER_VERSION_MINOR 18u
 #define BPFLOADER_VERSION ((BPFLOADER_VERSION_MAJOR << 16) | BPFLOADER_VERSION_MINOR)
 
 #include "bpf/BpfUtils.h"
@@ -724,15 +724,12 @@ static int createMaps(const char* elfPath, ifstream& elfFile, vector<unique_fd>&
     ret = getSectionSymNames(elfFile, "maps", mapNames);
     if (ret) return ret;
 
-    unsigned btfMinBpfLoaderVer = readSectionUint("btf_min_bpfloader_ver", elfFile, 0);
-    unsigned btfMinKernelVer = readSectionUint("btf_min_kernel_ver", elfFile, 0);
-    unsigned kvers = kernelVersion();
-
     std::optional<unique_fd> btfFd;
-    if ((BPFLOADER_VERSION >= btfMinBpfLoaderVer) && (kvers >= btfMinKernelVer) &&
-        (!readSectionByName(".BTF", elfFile, btfData))) {
+    if (!readSectionByName(".BTF", elfFile, btfData)) {
         btfFd = getMapBtfInfo(elfPath, btfTypeIdMap);
     }
+
+    unsigned kvers = kernelVersion();
 
     for (int i = 0; i < (int)mapNames.size(); i++) {
         if (BPFLOADER_VERSION < md[i].bpfloader_min_ver) {
@@ -795,6 +792,8 @@ static int createMaps(const char* elfPath, ifstream& elfFile, vector<unique_fd>&
             ALOGI("map %s selinux_context [%32s] -> %d -> '%s' (%s)", mapNames[i].c_str(),
                   md[i].selinux_context, selinux_context, lookupSelinuxContext(selinux_context),
                   lookupPinSubdir(selinux_context));
+            // temp disable until selinux grants bpfloader 'rename' priv
+            selinux_context = domain::unspecified;
         }
 
         domain pin_subdir = getDomainFromPinSubdir(md[i].pin_subdir);
@@ -1021,6 +1020,8 @@ static int loadCodeSections(const char* elfPath, vector<codeSection>& cs, const 
             ALOGI("prog %s selinux_context [%32s] -> %d -> '%s' (%s)", name.c_str(),
                   cs[i].prog_def->selinux_context, selinux_context,
                   lookupSelinuxContext(selinux_context), lookupPinSubdir(selinux_context));
+            // temp disable until selinux grants bpfloader 'rename' priv
+            selinux_context = domain::unspecified;
         }
 
         if (specified(pin_subdir)) {

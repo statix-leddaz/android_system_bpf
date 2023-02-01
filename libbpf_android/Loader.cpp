@@ -30,11 +30,16 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-// This is BpfLoader v0.28
+// This is BpfLoader v0.34
+// WARNING: If you ever hit cherrypick conflicts here you're doing it wrong:
+// You are NOT allowed to cherrypick bpfloader related patches out of order.
+// (indeed: cherrypicking is probably a bad idea and you should merge instead)
+// Mainline supports ONLY the published versions of the bpfloader for each Android release.
 #define BPFLOADER_VERSION_MAJOR 0u
-#define BPFLOADER_VERSION_MINOR 28u
+#define BPFLOADER_VERSION_MINOR 34u
 #define BPFLOADER_VERSION ((BPFLOADER_VERSION_MAJOR << 16) | BPFLOADER_VERSION_MINOR)
 
+#include "BpfSyscallWrappers.h"
 #include "bpf/BpfUtils.h"
 #include "bpf/bpf_map_def.h"
 #include "include/libbpf_android.h"
@@ -57,6 +62,7 @@
 #include <android-base/file.h>
 #include <android-base/strings.h>
 #include <android-base/unique_fd.h>
+#include <cutils/properties.h>
 
 #define BPF_FS_PATH "/sys/fs/bpf/"
 
@@ -74,8 +80,19 @@ using std::optional;
 using std::string;
 using std::vector;
 
+static std::string getBuildTypeInternal() {
+    char value[PROPERTY_VALUE_MAX] = {};
+    (void)property_get("ro.build.type", value, "unknown");  // ignore length
+    return value;
+}
+
 namespace android {
 namespace bpf {
+
+const std::string& getBuildType() {
+    static std::string t = getBuildTypeInternal();
+    return t;
+}
 
 constexpr const char* lookupSelinuxContext(const domain d, const char* const unspecified = "") {
     switch (d) {
@@ -87,6 +104,7 @@ constexpr const char* lookupSelinuxContext(const domain d, const char* const uns
         case domain::netd_readonly: return "fs_bpf_netd_readonly";
         case domain::netd_shared:   return "fs_bpf_netd_shared";
         case domain::vendor:        return "fs_bpf_vendor";
+        case domain::loader:        return "fs_bpf_loader";
         default:                    return "(unrecognized)";
     }
 }
@@ -118,6 +136,7 @@ constexpr const char* lookupPinSubdir(const domain d, const char* const unspecif
         case domain::netd_readonly: return "netd_readonly/";
         case domain::netd_shared:   return "netd_shared/";
         case domain::vendor:        return "vendor/";
+        case domain::loader:        return "loader/";
         default:                    return "(unrecognized)";
     }
 };
@@ -648,15 +667,6 @@ static std::optional<unique_fd> getMapBtfInfo(const char* elfPath,
 
 static bool mapMatchesExpectations(const unique_fd& fd, const string& mapName,
                                    const struct bpf_map_def& mapDef, const enum bpf_map_type type) {
-    // bpfGetFd... family of functions require at minimum a 4.14 kernel,
-    // so on 4.9 kernels just pretend the map matches our expectations.
-    // This isn't really a problem as we only really support 4.14+ anyway...
-    // Additionally we'll get almost equivalent test coverage on newer devices/kernels.
-    // This is because the primary failure mode we're trying to detect here
-    // is either a source code misconfiguration (which is likely kernel independent)
-    // or a newly introduced kernel feature/bug (which is unlikely to get backported to 4.9).
-    if (!isAtLeastKernelVersion(4, 14, 0)) return true;
-
     // Assuming fd is a valid Bpf Map file descriptor then
     // all the following should always succeed on a 4.14+ kernel.
     // If they somehow do fail, they'll return -1 (and set errno),
@@ -776,17 +786,15 @@ static int createMaps(const char* elfPath, ifstream& elfFile, vector<unique_fd>&
             continue;
         }
 
-        enum bpf_map_type type = md[i].type;
-        if (type == BPF_MAP_TYPE_DEVMAP && !isAtLeastKernelVersion(4, 14, 0)) {
-            // On Linux Kernels older than 4.14 this map type doesn't exist, but it can kind
-            // of be approximated: ARRAY has the same userspace api, though it is not usable
-            // by the same ebpf programs.  However, that's okay because the bpf_redirect_map()
-            // helper doesn't exist on 4.9 anyway (so the bpf program would fail to load,
-            // and thus needs to be tagged as 4.14+ either way), so there's nothing useful you
-            // could do with a DEVMAP anyway (that isn't already provided by an ARRAY)...
-            // Hence using an ARRAY instead of a DEVMAP simply makes life easier for userspace.
-            type = BPF_MAP_TYPE_ARRAY;
+        if ((md[i].ignore_on_eng && isEng()) || (md[i].ignore_on_user && isUser()) ||
+            (md[i].ignore_on_userdebug && isUserdebug())) {
+            ALOGI("skipping map %s which is ignored on %s builds", mapNames[i].c_str(),
+                  getBuildType().c_str());
+            mapFds.push_back(unique_fd());
+            continue;
         }
+
+        enum bpf_map_type type = md[i].type;
         if (type == BPF_MAP_TYPE_DEVMAP_HASH && !isAtLeastKernelVersion(5, 4, 0)) {
             // On Linux Kernels older than 5.4 this map type doesn't exist, but it can kind
             // of be approximated: HASH has the same userspace visible api.
@@ -1028,6 +1036,15 @@ static int loadCodeSections(const char* elfPath, vector<codeSection>& cs, const 
               bpfMinVer, bpfMaxVer);
         if (BPFLOADER_VERSION < bpfMinVer) continue;
         if (BPFLOADER_VERSION >= bpfMaxVer) continue;
+
+        if ((cs[i].prog_def->ignore_on_eng && isEng()) ||
+            (cs[i].prog_def->ignore_on_user && isUser()) ||
+            (cs[i].prog_def->ignore_on_userdebug && isUserdebug())) {
+            ALOGD("cs[%d].name:%s is ignored on %s builds", i, name.c_str(),
+                  getBuildType().c_str());
+            continue;
+        }
+
         if (unrecognized(pin_subdir)) return -ENOTDIR;
 
         if (specified(selinux_context)) {
@@ -1156,9 +1173,7 @@ static int loadCodeSections(const char* elfPath, vector<codeSection>& cs, const 
     return 0;
 }
 
-int loadProg(const char* elfPath, bool* isCritical, const char* prefix,
-             const unsigned long long allowedDomainBitmask, const bpf_prog_type* allowed,
-             size_t numAllowed) {
+int loadProg(const char* elfPath, bool* isCritical, const Location& location) {
     vector<char> license;
     vector<char> critical;
     vector<codeSection> cs;
@@ -1231,7 +1246,8 @@ int loadProg(const char* elfPath, bool* isCritical, const char* prefix,
         return -1;
     }
 
-    ret = readCodeSections(elfFile, cs, sizeOfBpfProgDef, allowed, numAllowed);
+    ret = readCodeSections(elfFile, cs, sizeOfBpfProgDef, location.allowedProgTypes,
+                           location.allowedProgTypesLength);
     if (ret) {
         ALOGE("Couldn't read all code sections in %s", elfPath);
         return ret;
@@ -1240,7 +1256,8 @@ int loadProg(const char* elfPath, bool* isCritical, const char* prefix,
     /* Just for future debugging */
     if (0) dumpAllCs(cs);
 
-    ret = createMaps(elfPath, elfFile, mapFds, prefix, allowedDomainBitmask, sizeOfBpfMapDef);
+    ret = createMaps(elfPath, elfFile, mapFds, location.prefix, location.allowedDomainBitmask,
+                     sizeOfBpfMapDef);
     if (ret) {
         ALOGE("Failed to create maps: (ret=%d) in %s", ret, elfPath);
         return ret;
@@ -1251,7 +1268,8 @@ int loadProg(const char* elfPath, bool* isCritical, const char* prefix,
 
     applyMapRelo(elfFile, mapFds, cs);
 
-    ret = loadCodeSections(elfPath, cs, string(license.data()), prefix, allowedDomainBitmask);
+    ret = loadCodeSections(elfPath, cs, string(license.data()), location.prefix,
+                           location.allowedDomainBitmask);
     if (ret) ALOGE("Failed to load programs, loadCodeSections ret=%d", ret);
 
     return ret;
